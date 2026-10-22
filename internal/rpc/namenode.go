@@ -62,13 +62,14 @@ type NamenodeConnection struct {
 	ClientCertificate string
 	ClientKey         string
 
-	dialFunc       func(ctx context.Context, network, addr string) (net.Conn, error)
-	dialTimeout    time.Duration
-	tcpUserTimeout time.Duration
-	conn           net.Conn
-	host           *namenodeHost
-	hostList       []*namenodeHost
-	transport      transport
+	dialFunc          func(ctx context.Context, network, addr string) (net.Conn, error)
+	dialTimeout       time.Duration
+	tcpUserTimeout    time.Duration
+	maxResponseLength uint32
+	conn              net.Conn
+	host              *namenodeHost
+	hostList          []*namenodeHost
+	transport         transport
 
 	reqLock sync.Mutex
 	done    chan struct{}
@@ -112,6 +113,8 @@ type NamenodeConnectionOptions struct {
 	// Bounds how long transmitted data may remain unacknowledged before aborting the connection.
 	// Only applied on platforms that support TCP_USER_TIMEOUT.
 	TCPUserTimeout time.Duration
+	// Bounds the size of one response in bytes; zero selects DefaultMaxResponseLength.
+	MaxResponseLength uint32
 }
 
 func effectiveTimeout(configured, def time.Duration) time.Duration {
@@ -170,7 +173,9 @@ func NewNamenodeConnection(options NamenodeConnectionOptions) (*NamenodeConnecti
 		dialTimeout:    effectiveTimeout(options.DialTimeout, DefaultDialTimeout),
 		tcpUserTimeout: effectiveTimeout(options.TCPUserTimeout, DefaultTCPUserTimeout),
 		hostList:       hostList,
-		transport:      &basicTransport{clientID: clientId},
+		transport:      &basicTransport{clientID: clientId, maxResponseLength: options.MaxResponseLength},
+
+		maxResponseLength: options.MaxResponseLength,
 
 		done: make(chan struct{}),
 	}
@@ -396,6 +401,11 @@ func (c *NamenodeConnection) AcquireLease() {
 // ReleaseLease records that a file recorded with AcquireLease was completed.
 func (c *NamenodeConnection) ReleaseLease() {
 	c.openWriters.Add(-1)
+}
+
+// OpenWriters reports how many of this client's files are under lease.
+func (c *NamenodeConnection) OpenWriters() int64 {
+	return c.openWriters.Load()
 }
 
 // renewLeases periodically renews the client's leases while it has files open for writing.

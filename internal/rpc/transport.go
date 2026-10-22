@@ -19,6 +19,8 @@ type transport interface {
 type basicTransport struct {
 	// clientID is the client ID of this writer.
 	clientID []byte
+	// maxResponseLength bounds one response; zero selects DefaultMaxResponseLength.
+	maxResponseLength uint32
 }
 
 // writeRequest writes an RPC message.
@@ -58,7 +60,7 @@ func (t *basicTransport) writeRequest(w io.Writer, method string, requestID int3
 // +-----------------------------------------------------------+
 func (t *basicTransport) readResponse(r io.Reader, method string, requestID int32, resp proto.Message) error {
 	rrh := &hadoop.RpcResponseHeaderProto{}
-	err := readRPCPacket(r, rrh, resp)
+	err := readRPCPacket(r, t.maxResponseLength, rrh, resp)
 	if err != nil {
 		return err
 	} else if int32(rrh.GetCallId()) != requestID {

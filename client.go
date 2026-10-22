@@ -113,6 +113,10 @@ type ClientOptions struct {
 	// Sets TCP_USER_TIMEOUT on namenode connections on platforms that support it.
 	// Zero selects the default; a negative value disables it.
 	NamenodeTCPUserTimeout time.Duration
+	// Bounds the size in bytes of one namenode response, such as the block locations of a whole file
+	// when it is opened for reading. Zero selects rpc.DefaultMaxResponseLength (128 MB); a file of
+	// very many blocks may need more.
+	NamenodeMaxResponseLength uint32
 
 	// skipSaslForPrivilegedDatanodePorts implements a strange edge case present
 	// in the official java client. If data.transfer.protection is set but not
@@ -273,6 +277,7 @@ func newClientInt(options ClientOptions, nnAddresses []string, leaderAddress str
 		ClientKey:                    options.ClientKey,
 		DialTimeout:                  options.NamenodeDialTimeout,
 		TCPUserTimeout:               options.NamenodeTCPUserTimeout,
+		MaxResponseLength:            options.NamenodeMaxResponseLength,
 	}
 
 	namenodeConn, err := rpc.NewNamenodeConnection(nnConnectionOptions)

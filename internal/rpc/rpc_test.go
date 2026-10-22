@@ -29,7 +29,7 @@ func TestReadRPCPacketRefusesATLSRecordWithoutAllocatingIt(t *testing.T) {
 	alert := []byte{0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}
 	var err error
 	allocated := allocatedDuring(func() {
-		err = readRPCPacket(bytes.NewReader(alert), &hadoop.RpcResponseHeaderProto{})
+		err = readRPCPacket(bytes.NewReader(alert), 0, &hadoop.RpcResponseHeaderProto{})
 	})
 
 	require.Error(t, err)
@@ -42,7 +42,7 @@ func TestReadRPCPacketRefusesAnOversizedResponse(t *testing.T) {
 	header := []byte{0x7f, 0xff, 0xff, 0xff}
 	var err error
 	allocated := allocatedDuring(func() {
-		err = readRPCPacket(bytes.NewReader(header), &hadoop.RpcResponseHeaderProto{})
+		err = readRPCPacket(bytes.NewReader(header), 0, &hadoop.RpcResponseHeaderProto{})
 	})
 
 	require.Error(t, err)
@@ -59,8 +59,28 @@ func TestReadRPCPacketReadsAResponseWithinTheLimit(t *testing.T) {
 	require.NoError(t, err)
 
 	received := &hadoop.RpcResponseHeaderProto{}
-	require.NoError(t, readRPCPacket(bytes.NewReader(packet), received))
+	require.NoError(t, readRPCPacket(bytes.NewReader(packet), 0, received))
 	assert.Equal(t, uint32(7), received.GetCallId())
+}
+
+func TestReadRPCPacketHonoursAConfiguredLimit(t *testing.T) {
+	sent := &hadoop.RpcResponseHeaderProto{
+		CallId: proto.Uint32(7),
+		Status: hadoop.RpcResponseHeaderProto_SUCCESS.Enum(),
+	}
+	packet, err := makeRPCPacket(sent)
+	require.NoError(t, err)
+
+	err = readRPCPacket(bytes.NewReader(packet), 2, &hadoop.RpcResponseHeaderProto{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds the 2 byte limit")
+
+	// A frame over the default bound is accepted when the connection raises it; the read then fails
+	// only because the test supplies no body.
+	header := []byte{0x08, 0x00, 0x00, 0x00}
+	err = readRPCPacket(bytes.NewReader(header), DefaultMaxResponseLength*2, &hadoop.RpcResponseHeaderProto{})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "exceeds")
 }
 
 // pipeNamenode stands in for a namenode: it accepts connections over net.Pipe and records how many

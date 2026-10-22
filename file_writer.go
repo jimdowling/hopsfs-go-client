@@ -508,6 +508,9 @@ func (f *FileWriter) Close() error {
 
 func (f *FileWriter) closeInt() error {
 	if f.lastError != nil {
+		// A failed writer can never complete the file, so, like the Java client's close, stop
+		// renewing its lease rather than keep this connection renewing for good.
+		f.releaseLease()
 		return f.lastError
 	}
 
