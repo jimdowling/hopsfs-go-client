@@ -121,6 +121,9 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 	if err != nil {
 		return nil, &os.PathError{"create", name, interpretCreateException(err)}
 	}
+	// The namenode granted the lease with the create, so renewal starts before the KMS request,
+	// which has no timeout and could otherwise outlast the lease.
+	c.namenode.AcquireLease()
 
 	storedInDB := false
 	if *createResp.Fs.StoragePolicy == uint32(14) {
@@ -131,6 +134,7 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 	if createResp.GetFs().GetFileEncryptionInfo() != nil {
 		enc, err = c.kmsGetKey(createResp.GetFs().GetFileEncryptionInfo())
 		if err != nil {
+			c.namenode.ReleaseLease()
 			_ = c.Remove(name)
 			return nil, &os.PathError{"create", name, err}
 		}
@@ -146,8 +150,8 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 		smallFileBuffer: []byte{},
 		pos:             0,
 		enc:             enc,
+		leaseHeld:       true,
 	}
-	f.acquireLease()
 	return f, nil
 }
 
@@ -157,10 +161,16 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 // all data has been written.
 func (c *Client) Append(name string) (_ *FileWriter, err error) {
 	var f *FileWriter
+	leased := false
 	// A writer that fails after the namenode granted the lease is not returned, so nothing would release it.
 	defer func() {
-		if err != nil && f != nil {
+		if err == nil {
+			return
+		}
+		if f != nil {
 			f.releaseLease()
+		} else if leased {
+			c.namenode.ReleaseLease()
 		}
 	}()
 
@@ -206,6 +216,9 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "append", Path: name, Err: interpretException(err)}
 	}
+	// Granted with the append; counted before the KMS request for the same reason as in create.
+	c.namenode.AcquireLease()
+	leased = true
 
 	var enc *transparentEncryptionInfo
 	if appendResp.GetStat().GetFileEncryptionInfo() != nil {
@@ -225,8 +238,8 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 		smallFileBuffer: []byte{},
 		pos:             *appendResp.GetStat().Length,
 		enc:             enc,
+		leaseHeld:       true,
 	}
-	f.acquireLease()
 
 	// This returns nil if there are no blocks (it's an empty file) or if the
 	// last block is full (so we have to start a fresh block).
@@ -561,11 +574,6 @@ func (f *FileWriter) closeInt() error {
 	}
 
 	return &os.PathError{Op: "create", Path: f.name, Err: errors.New("failed to close the file")}
-}
-
-func (f *FileWriter) acquireLease() {
-	f.leaseHeld = true
-	f.client.namenode.AcquireLease()
 }
 
 func (f *FileWriter) releaseLease() {
