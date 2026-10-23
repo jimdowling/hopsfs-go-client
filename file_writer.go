@@ -540,6 +540,10 @@ func (f *FileWriter) closeInt() error {
 			// Close the blockWriter, flushing any buffered packets.
 			err := f.closeBlock()
 			if err != nil {
+				// The block writer has dropped its datanode connection, so no retry can complete
+				// the file.
+				f.lastError = err
+				f.releaseLease()
 				return err
 			}
 		}

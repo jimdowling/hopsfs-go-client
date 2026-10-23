@@ -77,7 +77,7 @@ func TestReadRPCPacketHonoursAConfiguredLimit(t *testing.T) {
 
 	// A frame over the default bound is accepted when the connection raises it; the read then fails
 	// only because the test supplies no body.
-	header := []byte{0x08, 0x00, 0x00, 0x00}
+	header := []byte{0x08, 0x00, 0x00, 0x01}
 	err = readRPCPacket(bytes.NewReader(header), DefaultMaxResponseLength*2, &hadoop.RpcResponseHeaderProto{})
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "exceeds")
