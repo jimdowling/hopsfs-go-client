@@ -334,11 +334,8 @@ func TestFileReadDir(t *testing.T) {
 	assert.EqualValues(t, "dir", res[1].Name())
 
 	res, err = file.Readdir(0)
-	require.Equal(t, 4, len(res))
-	assert.EqualValues(t, "1", res[0].Name())
-	assert.EqualValues(t, "2", res[1].Name())
-	assert.EqualValues(t, "3", res[2].Name())
-	assert.EqualValues(t, "dir", res[3].Name())
+	require.NoError(t, err)
+	require.Empty(t, res)
 }
 
 func TestFileReadDirnames(t *testing.T) {
@@ -386,10 +383,8 @@ func TestFileReadDirMany(t *testing.T) {
 	}
 
 	res, err = file.Readdir(0)
-	require.Equal(t, total, len(res))
-	for i := range res {
-		assert.EqualValues(t, fmt.Sprintf("%04d", i), res[i].Name())
-	}
+	require.NoError(t, err)
+	require.Empty(t, res)
 }
 
 func TestOpenFileWithoutPermission(t *testing.T) {

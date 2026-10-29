@@ -71,7 +71,7 @@ func moveTo(client *hdfs.Client, source, dest string, force bool) {
 		if destInfo.IsDir() && !sourceInfo.IsDir() {
 			fatal("Can't replace directory with non-directory.")
 		} else if !force {
-			fatal(&os.PathError{"rename", dest, os.ErrExist})
+			fatal(&os.PathError{Op: "rename", Path: dest, Err: os.ErrExist})
 		}
 	} else if !os.IsNotExist(err) {
 		fatal(err)

@@ -4,7 +4,6 @@ import (
 	"time"
 
 	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
-	"github.com/colinmarc/hdfs/v2/internal/rpc"
 )
 
 // Get epoch from the namenode
@@ -30,8 +29,8 @@ func (c *Client) setEpoch() error {
 	if err != nil {
 		return err
 	}
-	epoch = epoch + diff
-	rpc.SetEpoch(endTime, epoch+diff)
+	c.namenode.SetEpoch(endTime, epoch+diff)
+	c.leaderNamenode.SetEpoch(endTime, epoch+diff)
 
 	return nil
 }

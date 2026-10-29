@@ -13,6 +13,7 @@ type NamenodeError struct {
 	code      int
 	exception string
 	message   string
+	fatal     bool
 }
 
 func (err *NamenodeError) Method() string {

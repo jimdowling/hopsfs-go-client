@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	hadoop "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
@@ -92,4 +93,20 @@ func TestWriteRequestNamesPipelineStorages(t *testing.T) {
 	op = decodeWriteRequest(t, buf.Bytes())
 	assert.Nil(t, op.StorageId)
 	assert.Empty(t, op.GetTargetStorageIds())
+}
+
+func BenchmarkWritePacket(b *testing.B) {
+	stream := &blockWriteStream{conn: struct {
+		io.Reader
+		io.Writer
+	}{Writer: io.Discard}}
+	packet := outboundPacket{seqno: 1, data: make([]byte, outboundPacketSize), checksums: make([]byte, outboundPacketSize/outboundChunkSize*4)}
+	b.ReportAllocs()
+	b.SetBytes(outboundPacketSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := stream.writePacket(packet); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

@@ -138,7 +138,7 @@ func baleet(t *testing.T, path string) {
 func assertPathError(t *testing.T, err error, op, path string, wrappedErr error) {
 	require.NotNil(t, err)
 
-	expected := &os.PathError{op, path, wrappedErr}
+	expected := &os.PathError{Op: op, Path: path, Err: wrappedErr}
 	require.Equal(t, expected.Error(), err.Error())
 	require.Equal(t, expected, err)
 }

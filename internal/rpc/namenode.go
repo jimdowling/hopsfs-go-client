@@ -7,9 +7,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
-	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,7 @@ const (
 
 	DefaultDialTimeout    = 30 * time.Second
 	DefaultTCPUserTimeout = 30 * time.Second
+	DefaultRequestTimeout = 30 * time.Second
 	// The TCP keep-alive probe interval used for idle namenode connections.
 	keepAliveInterval = 15 * time.Second
 )
@@ -61,21 +63,30 @@ type NamenodeConnection struct {
 	RootCABundle      string
 	ClientCertificate string
 	ClientKey         string
+	TLSServerName     string
 
+	baseDialFunc      func(ctx context.Context, network, addr string) (net.Conn, error)
 	dialFunc          func(ctx context.Context, network, addr string) (net.Conn, error)
 	dialTimeout       time.Duration
 	tcpUserTimeout    time.Duration
 	maxResponseLength uint32
+	requestTimeout    time.Duration
 	conn              net.Conn
 	host              *namenodeHost
 	hostList          []*namenodeHost
 	transport         transport
 
-	reqLock sync.Mutex
-	done    chan struct{}
+	reqLock   chan struct{}
+	connMu    sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+	closed    atomic.Bool
+	done      chan struct{}
+	renewDone chan struct{}
 
 	// openWriters counts this client's files under lease; leases are renewed only while it is above zero.
 	openWriters atomic.Int64
+	epoch       atomic.Pointer[rpcEpoch]
 }
 
 // NamenodeConnectionOptions represents the configurable options available
@@ -107,6 +118,8 @@ type NamenodeConnectionOptions struct {
 	RootCABundle      string
 	ClientCertificate string
 	ClientKey         string
+	// TLSServerName overrides the certificate identity when dialing through a proxy.
+	TLSServerName string
 
 	// Bounds how long establishing a TCP (and TLS) connection to a namenode may take.
 	DialTimeout time.Duration
@@ -115,6 +128,9 @@ type NamenodeConnectionOptions struct {
 	TCPUserTimeout time.Duration
 	// Bounds the size of one response in bytes; zero selects DefaultMaxResponseLength.
 	MaxResponseLength uint32
+	// RequestTimeout bounds a complete RPC, including queueing and failover.
+	// Zero selects DefaultRequestTimeout; a negative value disables the default.
+	RequestTimeout time.Duration
 }
 
 func effectiveTimeout(configured, def time.Duration) time.Duration {
@@ -136,6 +152,9 @@ type namenodeHost struct {
 // NewNamenodeConnectionWithOptions creates a new connection to a namenode with
 // the given options and performs an initial handshake.
 func NewNamenodeConnection(options NamenodeConnectionOptions) (*NamenodeConnection, error) {
+	if len(options.Addresses) == 0 {
+		return nil, errors.New("no namenode addresses specified")
+	}
 	// Build the list of hosts to be used for failover.
 	hostList := make([]*namenodeHost, len(options.Addresses))
 	for i, addr := range options.Addresses {
@@ -168,17 +187,21 @@ func NewNamenodeConnection(options NamenodeConnectionOptions) (*NamenodeConnecti
 		RootCABundle:      options.RootCABundle,
 		ClientCertificate: options.ClientCertificate,
 		ClientKey:         options.ClientKey,
+		TLSServerName:     options.TLSServerName,
 
 		dialFunc:       options.DialFunc,
+		baseDialFunc:   options.DialFunc,
 		dialTimeout:    effectiveTimeout(options.DialTimeout, DefaultDialTimeout),
 		tcpUserTimeout: effectiveTimeout(options.TCPUserTimeout, DefaultTCPUserTimeout),
 		hostList:       hostList,
-		transport:      &basicTransport{clientID: clientId, maxResponseLength: options.MaxResponseLength},
 
 		maxResponseLength: options.MaxResponseLength,
+		requestTimeout:    effectiveTimeout(options.RequestTimeout, DefaultRequestTimeout),
 
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		reqLock: make(chan struct{}, 1),
 	}
+	c.transport = &basicTransport{clientID: clientId, maxResponseLength: options.MaxResponseLength, epoch: c.epochSec}
 
 	if options.TLS {
 		c.dialFunc = c.tlsDialFunction
@@ -186,18 +209,27 @@ func NewNamenodeConnection(options NamenodeConnectionOptions) (*NamenodeConnecti
 		c.dialFunc = c.newDialer().DialContext
 	}
 
-	err := c.resolveConnection()
+	err := c.resolveConnection(context.Background())
 	if err != nil {
+		c.Close()
 		return nil, err
 	}
 
 	// Periodically renew any file leases.
-	go c.renewLeases()
+	c.renewDone = make(chan struct{})
+	interval := leaseRenewInterval
+	go func() {
+		defer close(c.renewDone)
+		c.renewLeases(interval)
+	}()
 
 	return c, nil
 }
 
-func (c *NamenodeConnection) resolveConnection() error {
+func (c *NamenodeConnection) resolveConnection(ctx context.Context) error {
+	if c.closed.Load() {
+		return io.ErrClosedPipe
+	}
 	if c.conn != nil {
 		return nil
 	}
@@ -208,19 +240,34 @@ func (c *NamenodeConnection) resolveConnection() error {
 	}
 
 	for _, host := range c.hostList {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if time.Since(host.lastErrorAt) < backoffDuration {
 			continue
 		}
 
 		c.host = host
 		deadline := c.connectDeadline()
-		c.conn, err = c.dial(host.address, deadline)
+		if limit, ok := ctx.Deadline(); ok && (deadline.IsZero() || limit.Before(deadline)) {
+			deadline = limit
+		}
+		var conn net.Conn
+		conn, err = c.dial(ctx, host.address, deadline)
 		if err != nil {
 			c.markFailure(err)
 			continue
 		}
+		c.connMu.Lock()
+		if c.closed.Load() {
+			c.connMu.Unlock()
+			conn.Close()
+			return io.ErrClosedPipe
+		}
+		c.conn = conn
+		c.connMu.Unlock()
 
-		err = c.handshake(deadline)
+		err = c.handshake(ctx, deadline)
 		if err != nil {
 			c.markFailure(err)
 			continue
@@ -258,8 +305,7 @@ func (c *NamenodeConnection) connectDeadline() time.Time {
 }
 
 // dial connects to address, giving up at deadline unless it is zero.
-func (c *NamenodeConnection) dial(address string, deadline time.Time) (net.Conn, error) {
-	ctx := context.Background()
+func (c *NamenodeConnection) dial(ctx context.Context, address string, deadline time.Time) (net.Conn, error) {
 	if !deadline.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, deadline)
@@ -268,11 +314,8 @@ func (c *NamenodeConnection) dial(address string, deadline time.Time) (net.Conn,
 	return c.dialFunc(ctx, "tcp", address)
 }
 
-func (c *NamenodeConnection) handshake(deadline time.Time) error {
-	if deadline.IsZero() {
-		return c.doNamenodeHandshake()
-	}
-	if err := c.conn.SetDeadline(deadline); err != nil {
+func (c *NamenodeConnection) handshake(ctx context.Context, deadline time.Time) error {
+	if err := c.setDeadline(ctx, deadline); err != nil {
 		return fmt.Errorf("setting handshake deadline: %w", err)
 	}
 	err := c.doNamenodeHandshake()
@@ -282,7 +325,19 @@ func (c *NamenodeConnection) handshake(deadline time.Time) error {
 	return err
 }
 
+func (c *NamenodeConnection) setDeadline(ctx context.Context, deadline time.Time) error {
+	// A cancelled request's watcher must not have its interrupt cleared by setup.
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.conn.SetDeadline(deadline)
+}
+
 func (c *NamenodeConnection) markFailure(err error) {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
@@ -294,32 +349,96 @@ func (c *NamenodeConnection) markFailure(err error) {
 // Execute performs an rpc call. It does this by sending req over the wire and
 // unmarshaling the result into resp.
 func (c *NamenodeConnection) Execute(method string, req proto.Message, resp proto.Message) error {
-	c.reqLock.Lock()
-	defer c.reqLock.Unlock()
+	return c.ExecuteContext(context.Background(), method, req, resp)
+}
+
+// ExecuteContext performs an RPC within ctx and the configured request timeout.
+func (c *NamenodeConnection) ExecuteContext(ctx context.Context, method string, req proto.Message, resp proto.Message) error {
+	var cancel context.CancelFunc
+	if c.requestTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, c.requestTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return io.ErrClosedPipe
+	case c.reqLock <- struct{}{}:
+	}
+	defer func() { <-c.reqLock }()
+	finished := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-finished:
+			return
+		case <-ctx.Done():
+		case <-c.done:
+			cancel()
+		}
+		c.connMu.Lock()
+		if c.conn != nil {
+			c.conn.SetDeadline(time.Now())
+		}
+		c.connMu.Unlock()
+	}()
+	defer func() {
+		close(finished)
+		<-watcherDone
+		if c.conn != nil {
+			c.conn.SetDeadline(time.Time{})
+		}
+	}()
+	return c.execute(ctx, method, req, resp)
+}
+
+func (c *NamenodeConnection) execute(ctx context.Context, method string, req proto.Message, resp proto.Message) error {
 
 	c.currentRequestID++
 	requestID := c.currentRequestID
 
 	for {
-		err := c.resolveConnection()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := c.resolveConnection(ctx)
 		if err != nil {
+			return err
+		}
+		deadline, _ := ctx.Deadline()
+		if err := c.setDeadline(ctx, deadline); err != nil {
+			c.markFailure(err)
 			return err
 		}
 
 		err = c.transport.writeRequest(c.conn, method, requestID, req)
 		if err != nil {
 			c.markFailure(err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			continue
 		}
 
 		err = c.transport.readResponse(c.conn, method, requestID, resp)
 		if err != nil {
+			if ctx.Err() != nil {
+				c.markFailure(err)
+				return ctx.Err()
+			}
 			if nerr, ok := err.(*NamenodeError); ok {
 				// The namenode answered, so the connection itself is healthy.
 				// Only retry on a standby exception.
-				if nerr.exception == standbyExceptionClass {
+				if nerr.exception == standbyExceptionClass || nerr.exception == "org.apache.hadoop.ipc.NotALeaderException" || strings.HasPrefix(nerr.message, "org.apache.hadoop.ipc.NotALeaderException") {
 					c.markFailure(err)
 					continue
+				}
+				if nerr.fatal {
+					c.markFailure(err)
 				}
 				return err
 			}
@@ -383,6 +502,7 @@ func (c *NamenodeConnection) doNamenodeHandshake() error {
 	}
 
 	rrh := newRPCRequestHeader(handshakeCallID, c.ClientID)
+	rrh.Epoch = proto.Int64(c.epochSec())
 	cc := newConnectionContext(c.User, c.kerberosRealm)
 	packet, err := makeRPCPacket(rrh, cc)
 	if err != nil {
@@ -413,8 +533,8 @@ func (c *NamenodeConnection) OpenWriters() int64 {
 // A client with no open writers holds no lease, so it sends nothing. Renewing anyway kept every
 // idle reader calling the namenode each second, and redialling it after each failure for as long
 // as the process lived.
-func (c *NamenodeConnection) renewLeases() {
-	ticker := time.NewTicker(leaseRenewInterval)
+func (c *NamenodeConnection) renewLeases(interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -436,17 +556,21 @@ func (c *NamenodeConnection) renewLeases() {
 
 // Close terminates all underlying socket connections to remote server.
 func (c *NamenodeConnection) Close() error {
-	close(c.done)
-
-	// Ensure that we're not concurrently renewing leases.
-	c.reqLock.Lock()
-	defer c.reqLock.Unlock()
-
-	if c.conn != nil {
-		return c.conn.Close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.done != nil {
+			close(c.done)
+		}
+		c.connMu.Lock()
+		defer c.connMu.Unlock()
+		if c.conn != nil {
+			c.closeErr = c.conn.Close()
+		}
+	})
+	if c.renewDone != nil {
+		<-c.renewDone
 	}
-
-	return nil
+	return c.closeErr
 }
 
 func (c *NamenodeConnection) tlsDialFunction(ctx context.Context, network, address string) (net.Conn, error) {
@@ -475,43 +599,30 @@ func (c *NamenodeConnection) tlsDialFunction(ctx context.Context, network, addre
 		config.RootCAs.AddCert(x509Cert)
 	}
 
-	config.Certificates = []tls.Certificate{clientCert}
-	config.InsecureSkipVerify = true
-
-	config.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-		// If this is the first handshake on a connection, process and
-		// (optionally) verify the server's certificates.
-		certs := make([]*x509.Certificate, len(rawCerts))
-
-		for i, asn1Data := range rawCerts {
-			cert, err := x509.ParseCertificate(asn1Data)
-			if err != nil {
-				return fmt.Errorf("parsing the namenode's certificate: %w", err)
-			}
-			certs[i] = cert
-		}
-
-		opts := x509.VerifyOptions{
-			Roots:         config.RootCAs,
-			CurrentTime:   time.Now(),
-			DNSName:       "", // <- skip hostname verification
-			Intermediates: x509.NewCertPool(),
-		}
-
-		for i, cert := range certs {
-			if i == 0 {
-				continue
-			}
-			opts.Intermediates.AddCert(cert)
-		}
-		_, err := certs[0].Verify(opts)
-		return err
+	if len(certChain.Certificate) == 0 {
+		return nil, fmt.Errorf("root CA bundle %s contains no certificates", c.RootCABundle)
 	}
-
-	dialer := &tls.Dialer{NetDialer: c.newDialer(), Config: config}
-	conn, err := dialer.DialContext(ctx, network, address)
+	config.Certificates = []tls.Certificate{clientCert}
+	config.MinVersion = tls.VersionTLS12
+	config.ServerName = c.TLSServerName
+	if config.ServerName == "" {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		config.ServerName = host
+	}
+	dial := c.baseDialFunc
+	if dial == nil {
+		dial = c.newDialer().DialContext
+	}
+	raw, err := dial(ctx, network, address)
 	if err != nil {
-		log.Println(err)
+		return nil, err
+	}
+	conn := tls.Client(raw, config)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		raw.Close()
 		return nil, err
 	}
 	return conn, nil
@@ -565,21 +676,33 @@ func newConnectionContext(user, kerberosRealm string) *hadoop.IpcConnectionConte
 	}
 }
 
-var serverReportedEpoch int64 = 0
-var epochReportTime time.Time = time.Now()
+type rpcEpoch struct {
+	reported int64
+	at       time.Time
+}
+
+var defaultEpoch atomic.Pointer[rpcEpoch]
 
 func SetEpoch(reportTime time.Time, epoch int64) {
-	serverReportedEpoch = epoch
-	epochReportTime = reportTime
+	defaultEpoch.Store(&rpcEpoch{reported: epoch, at: reportTime})
 }
 
 func getRpcEpochSec() int64 {
-	if serverReportedEpoch == 0 {
+	return epochSec(defaultEpoch.Load())
+}
+
+func epochSec(epoch *rpcEpoch) int64 {
+	if epoch == nil || epoch.reported == 0 {
 		return 0
-	} else {
-		timePassed := time.Since(epochReportTime).Milliseconds()
-		currentTime := serverReportedEpoch + timePassed
-		epoch := currentTime / 1000
-		return epoch
 	}
+	return (epoch.reported + time.Since(epoch.at).Milliseconds()) / 1000
+}
+
+// SetEpoch sets this connection's server time in milliseconds.
+func (c *NamenodeConnection) SetEpoch(reportTime time.Time, epoch int64) {
+	c.epoch.Store(&rpcEpoch{reported: epoch, at: reportTime})
+}
+
+func (c *NamenodeConnection) epochSec() int64 {
+	return epochSec(c.epoch.Load())
 }

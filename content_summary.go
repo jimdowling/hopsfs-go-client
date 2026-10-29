@@ -21,7 +21,7 @@ type ContentSummary struct {
 func (c *Client) GetContentSummary(name string) (*ContentSummary, error) {
 	cs, err := c.getContentSummary(name)
 	if err != nil {
-		err = &os.PathError{"content summary", name, interpretException(err)}
+		err = &os.PathError{Op: "content summary", Path: name, Err: interpretException(err)}
 	}
 
 	return cs, err

@@ -17,12 +17,6 @@ const (
 
 // Rename renames (moves) a file.
 func (c *Client) Rename(oldpath, newpath string) error {
-	_, err := c.getFileInfo(newpath)
-	err = interpretException(err)
-	if err != nil && !os.IsNotExist(err) {
-		return &os.PathError{"rename", newpath, err}
-	}
-
 	req := &hdfs.Rename2RequestProto{
 		Src:           proto.String(oldpath),
 		Dst:           proto.String(newpath),
@@ -30,21 +24,15 @@ func (c *Client) Rename(oldpath, newpath string) error {
 	}
 	resp := &hdfs.Rename2ResponseProto{}
 
-	err = c.leaderNamenode.Execute("rename2", req, resp)
+	err := c.leaderNamenode.Execute("rename2", req, resp)
 	if err != nil {
-		return &os.PathError{"rename", oldpath, interpretException(err)}
+		return &os.PathError{Op: "rename", Path: oldpath, Err: interpretException(err)}
 	}
 
 	return nil
 }
 
 func (c *Client) Rename2(oldpath, newpath string, options RenameOptions) error {
-	_, err := c.getFileInfo(newpath)
-	err = interpretException(err)
-	if err != nil && !os.IsNotExist(err) {
-		return &os.PathError{"rename", newpath, err}
-	}
-
 	req := &hdfs.Rename2RequestProto{
 		Src:           proto.String(oldpath),
 		Dst:           proto.String(newpath),
@@ -65,9 +53,9 @@ func (c *Client) Rename2(oldpath, newpath string, options RenameOptions) error {
 
 	resp := &hdfs.Rename2ResponseProto{}
 
-	err = c.leaderNamenode.Execute("rename2", req, resp)
+	err := c.leaderNamenode.Execute("rename2", req, resp)
 	if err != nil {
-		return &os.PathError{"rename2", oldpath, interpretException(err)}
+		return &os.PathError{Op: "rename2", Path: oldpath, Err: interpretException(err)}
 	}
 
 	return nil

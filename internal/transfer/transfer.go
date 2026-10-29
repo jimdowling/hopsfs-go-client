@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"net"
 	"strconv"
 
 	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	dataTransferVersion = 0x1c
-	writeBlockOp        = 0x50
-	readBlockOp         = 0x51
-	checksumBlockOp     = 0x55
+	dataTransferVersion          = 0x1c
+	writeBlockOp                 = 0x50
+	readBlockOp                  = 0x51
+	checksumBlockOp              = 0x55
+	maxDataTransferMessageLength = 1 << 20
 )
 
 var errInvalidResponse = errors.New("invalid response from datanode")
@@ -34,36 +35,31 @@ func makePrefixedMessage(msg proto.Message) ([]byte, error) {
 }
 
 func readPrefixedMessage(r io.Reader, msg proto.Message) error {
-	varintBytes := make([]byte, binary.MaxVarintLen32)
-	n, err := io.ReadAtLeast(r, varintBytes, binary.MaxVarintLen32)
-	if err == io.EOF {
-		return io.ErrUnexpectedEOF
-	} else if err != nil {
-		return err
+	var prefix [binary.MaxVarintLen32]byte
+	for i := range prefix {
+		if _, err := io.ReadFull(r, prefix[i:i+1]); err != nil {
+			if err == io.EOF {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if prefix[i] >= 0x80 {
+			continue
+		}
+		length, n := binary.Uvarint(prefix[:i+1])
+		if n <= 0 || length > maxDataTransferMessageLength {
+			return errInvalidResponse
+		}
+		payload := make([]byte, int(length))
+		if _, err := io.ReadFull(r, payload); err != nil {
+			if err == io.EOF {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		return proto.Unmarshal(payload, msg)
 	}
-
-	respLength, varintLength := binary.Uvarint(varintBytes)
-
-	// The latter case happens if the datanode sent us an empty message, and
-	// it we read too many bytes from the conn (i.e., we read bytes from the
-	// next message). Since we can't put them back in the pipe, this is
-	// irreperable. We could avoid this by reading one byte at a time until we
-	// have a varint, but in practice this shouldn't happen anyway.
-	if varintLength < 1 || varintLength+int(respLength) < n {
-		return errInvalidResponse
-	}
-
-	// We may have grabbed too many bytes when reading the varint.
-	respBytes := make([]byte, respLength)
-	extraLength := copy(respBytes, varintBytes[varintLength:])
-	_, err = io.ReadFull(r, respBytes[extraLength:])
-	if err == io.EOF {
-		return io.ErrUnexpectedEOF
-	} else if err != nil {
-		return err
-	}
-
-	return proto.Unmarshal(respBytes, msg)
+	return errInvalidResponse
 }
 
 // A op request to a datanode:
@@ -104,7 +100,7 @@ func readBlockOpResponse(r io.Reader) (*hdfs.BlockOpResponseProto, error) {
 const HOPSFS_CLOUD_DATANODE_HOSTNAME_OVERRIDE_ENV = "HOPSFS_CLOUD_DATANODE_HOSTNAME_OVERRIDE"
 const HOPSFS_CLOUD_DATANODE_PORT_OVERRIDE_ENV = "HOPSFS_CLOUD_DATANODE_PORT_OVERRIDE"
 
-func getDatanodeAddress(datanode *hdfs.DatanodeIDProto, useHostname bool) string {
+func getDatanodeAddress(datanode *hdfs.DatanodeIDProto, useHostname bool) (string, error) {
 	var host string
 	if useHostname {
 		host = datanode.GetHostName()
@@ -112,9 +108,6 @@ func getDatanodeAddress(datanode *hdfs.DatanodeIDProto, useHostname bool) string
 		host = datanode.GetIpAddr()
 	}
 	port := datanode.GetXferPort()
-
-	//Uncomment for debugging
-	//oldAdd := fmt.Sprintf("%s:%d", host, port)
 
 	hostOverride := getEnv(HOPSFS_CLOUD_DATANODE_HOSTNAME_OVERRIDE_ENV)
 	portOverride := getEnv(HOPSFS_CLOUD_DATANODE_PORT_OVERRIDE_ENV)
@@ -124,19 +117,15 @@ func getDatanodeAddress(datanode *hdfs.DatanodeIDProto, useHostname bool) string
 	}
 
 	if portOverride != "" {
-		i, err := strconv.ParseInt(portOverride, 10, 32)
+		i, err := strconv.ParseUint(portOverride, 10, 16)
 		if err != nil {
-			fmt.Printf("Bad override port. %s:%s", HOPSFS_CLOUD_DATANODE_PORT_OVERRIDE_ENV, portOverride)
-			os.Exit(1)
+			return "", fmt.Errorf("invalid %s %q: %w", HOPSFS_CLOUD_DATANODE_PORT_OVERRIDE_ENV, portOverride, err)
 		}
 		port = uint32(i)
 	}
 
-	//Uncomment for debugging
-	//if portOverride != "" || hostOverride != "" {
-	//	newAdd := fmt.Sprintf("%s:%d", host, port)
-	//	fmt.Printf("Override Datanode address: %s with %s\n", oldAdd, newAdd)
-	//}
-
-	return fmt.Sprintf("%s:%d", host, port)
+	if port == 0 || port > 65535 {
+		return "", fmt.Errorf("invalid datanode transfer port: %d", port)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }

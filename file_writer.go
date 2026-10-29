@@ -1,8 +1,9 @@
 package hdfs
 
 import (
-	"crypto/cipher"
+	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ import (
 )
 
 const MaxSmallFileSize = 1024 * 64
+
+const maxWriteChunkSize = 64 << 10
 
 var ErrReplicating = errors.New("replication in progress")
 
@@ -41,7 +44,12 @@ type FileWriter struct {
 	storeInDB       bool
 	smallFileBuffer []byte
 	pos             uint64
+	writeOffset     uint64
+	lastBlock       *hdfs.ExtendedBlockProto
+	encryptedBuffer []byte
 	lastError       error
+	closed          bool
+	closing         bool
 	// newGS is the bumped generation stamp returned by
 	// updateBlockForPipeline during Append(). It is the GS the DN
 	// finalized at, so the `complete` RPC must report this value as the
@@ -58,14 +66,6 @@ type FileWriter struct {
 // asynchronously, it is very important that Close is called after all data has
 // been written.
 func (c *Client) Create(name string) (*FileWriter, error) {
-	_, err := c.getFileInfo(name)
-	err = interpretException(err)
-	if err == nil {
-		return nil, &os.PathError{Op: "create", Path: name, Err: os.ErrExist}
-	} else if !os.IsNotExist(err) {
-		return nil, &os.PathError{Op: "create", Path: name, Err: err}
-	}
-
 	defaults, err := c.fetchDefaults()
 	if err != nil {
 		return nil, err
@@ -94,6 +94,9 @@ func (c *Client) CreateFileWithGroup(name string, replication int, blockSize int
 }
 
 func (c *Client) createFileWithGroup(name string, replication int, blockSize int64, perm os.FileMode, overwrite bool, createParent bool, groupname string) (*FileWriter, error) {
+	if replication <= 0 || replication > 32767 || blockSize <= 0 {
+		return nil, &os.PathError{Op: "create", Path: name, Err: os.ErrInvalid}
+	}
 	createFlag := proto.Uint32(1)
 	if overwrite {
 		createFlag = proto.Uint32(3) // 0x01 for Create and 0x10 for overwrite
@@ -119,14 +122,13 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 
 	err := c.namenode.Execute("create", createReq, createResp)
 	if err != nil {
-		return nil, &os.PathError{"create", name, interpretCreateException(err)}
+		return nil, &os.PathError{Op: "create", Path: name, Err: interpretCreateException(err)}
 	}
-	// The namenode granted the lease with the create, so renewal starts before the KMS request,
-	// which has no timeout and could otherwise outlast the lease.
+	// Count the granted lease before KMS lookups so renewal also covers slow key retrieval.
 	c.namenode.AcquireLease()
 
 	storedInDB := false
-	if *createResp.Fs.StoragePolicy == uint32(14) {
+	if createResp.GetFs().GetStoragePolicy() == uint32(14) {
 		storedInDB = true
 	}
 
@@ -136,16 +138,20 @@ func (c *Client) createFileWithGroup(name string, replication int, blockSize int
 		if err != nil {
 			c.namenode.ReleaseLease()
 			_ = c.Remove(name)
-			return nil, &os.PathError{"create", name, err}
+			return nil, &os.PathError{Op: "create", Path: name, Err: err}
 		}
 	}
 
+	var fileID *uint64
+	if status := createResp.GetFs(); status != nil {
+		fileID = status.FileId
+	}
 	f := &FileWriter{
 		client:          c,
 		name:            name,
 		replication:     replication,
 		blockSize:       blockSize,
-		fileId:          createResp.Fs.FileId,
+		fileId:          fileID,
 		storeInDB:       storedInDB,
 		smallFileBuffer: []byte{},
 		pos:             0,
@@ -174,11 +180,6 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 		}
 	}()
 
-	_, err = c.getFileInfo(name)
-	if err != nil {
-		return nil, &os.PathError{Op: "append", Path: name, Err: interpretException(err)}
-	}
-
 	appendReq := &hdfs.AppendRequestProto{
 		Src:        proto.String(name),
 		ClientName: proto.String(c.namenode.ClientName),
@@ -186,7 +187,7 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 	appendResp := &hdfs.AppendResponseProto{}
 
 	initDelay := time.Duration(100)
-	for i := 0; i < 9; i++ { // 1 min max
+	for i := 0; i < 9; i++ {
 		err = c.namenode.Execute("append", appendReq, appendResp)
 		// Retry on transient append-time errors:
 		//   - NotReplicatedYetException: NN-side wraps this in RetriableException
@@ -202,6 +203,9 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 		if err != nil &&
 			(strings.Contains(err.Error(), "NotReplicatedYetException") ||
 				strings.Contains(err.Error(), "is not sufficiently replicated yet")) {
+			if i == 8 {
+				break
+			}
 			time.Sleep(initDelay * time.Millisecond)
 			initDelay *= 2
 		} else if err != nil {
@@ -219,12 +223,19 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 	// Granted with the append; counted before the KMS request for the same reason as in create.
 	c.namenode.AcquireLease()
 	leased = true
+	if appendResp.GetStat() == nil {
+		info, statErr := c.getFileInfo(name)
+		if statErr != nil {
+			return nil, &os.PathError{Op: "append", Path: name, Err: interpretException(statErr)}
+		}
+		appendResp.Stat = info.Sys().(*FileStatus)
+	}
 
 	var enc *transparentEncryptionInfo
 	if appendResp.GetStat().GetFileEncryptionInfo() != nil {
 		enc, err = c.kmsGetKey(appendResp.GetStat().GetFileEncryptionInfo())
 		if err != nil {
-			return nil, &os.PathError{"append", name, err}
+			return nil, &os.PathError{Op: "append", Path: name, Err: err}
 		}
 	}
 
@@ -236,7 +247,8 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 		fileId:          appendResp.Stat.FileId,
 		storeInDB:       false,
 		smallFileBuffer: []byte{},
-		pos:             *appendResp.GetStat().Length,
+		pos:             appendResp.GetStat().GetLength(),
+		writeOffset:     appendResp.GetStat().GetLength(),
 		enc:             enc,
 		leaseHeld:       true,
 	}
@@ -251,6 +263,7 @@ func (c *Client) Append(name string) (_ *FileWriter, err error) {
 	//handling appending to phantom block
 	if len(appendResp.GetBlock().Data) > 0 {
 		f.storeInDB = true
+		f.writeOffset = 0
 		f.smallFileBuffer = appendResp.GetBlock().Data
 		return f, nil
 	}
@@ -354,7 +367,11 @@ func (c *Client) CreateEmptyFile(name string) error {
 		return err
 	}
 
-	return f.Close()
+	err = f.Close()
+	if err != nil {
+		f.Abort()
+	}
+	return err
 }
 
 // SetDeadline sets the deadline for future Write, Flush, and Close calls. A
@@ -377,23 +394,42 @@ func (f *FileWriter) SetDeadline(t time.Time) error {
 // of this, it is important that Close is called after all data has been
 // written.
 func (f *FileWriter) Write(b []byte) (int, error) {
-	if f.storeInDB {
-		f.smallFileBuffer = append(f.smallFileBuffer, b...)
-		if len(f.smallFileBuffer) <= MaxSmallFileSize {
-			return len(b), nil // written successfully
-		} else { // we have exceeded small file limit
-			f.storeInDB = false
-			_, err := f.writeInternal(f.smallFileBuffer)
-			// we already acked for some data in the previous return statements
-			return len(b), err
-		}
-	} else {
-		n, err := f.writeInternal(b)
-		if err != nil {
-			f.lastError = err
-		}
-		return n, err
+	if f.lastError != nil {
+		return 0, f.lastError
 	}
+	if f.closed || f.closing {
+		return 0, io.ErrClosedPipe
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if f.storeInDB {
+		if len(b) <= MaxSmallFileSize-len(f.smallFileBuffer) {
+			f.smallFileBuffer = append(f.smallFileBuffer, b...)
+			f.pos += uint64(len(b))
+			return len(b), nil
+		}
+		if err := f.promoteSmallFile(); err != nil {
+			return 0, f.fail(err)
+		}
+	}
+	n, err := f.writeInternal(b)
+	f.pos += uint64(n)
+	if err != nil {
+		err = f.fail(err)
+	}
+	return n, err
+}
+
+func (f *FileWriter) promoteSmallFile() error {
+	if len(f.smallFileBuffer) > 0 {
+		if _, err := f.writeInternal(f.smallFileBuffer); err != nil {
+			return err
+		}
+	}
+	f.smallFileBuffer = nil
+	f.storeInDB = false
+	return nil
 }
 
 func (f *FileWriter) writeInternal(b []byte) (int, error) {
@@ -406,35 +442,51 @@ func (f *FileWriter) writeInternal(b []byte) (int, error) {
 
 	off := 0
 	for off < len(b) {
-		var n int
-		var err error
+		if f.blockWriter.Offset >= f.blockWriter.BlockSize {
+			if err := f.startNewBlock(); err != nil {
+				return off, err
+			}
+		}
+		count := len(b) - off
+		if count > maxWriteChunkSize {
+			count = maxWriteChunkSize
+		}
+		if remaining := f.blockWriter.BlockSize - f.blockWriter.Offset; int64(count) > remaining {
+			count = int(remaining)
+		}
+		if count <= 0 {
+			return off, errors.New("invalid block capacity")
+		}
+		part := b[off : off+count]
 		if f.enc != nil {
 			if f.enc.stream == nil {
-				f.enc.stream, err = aesCreateCTRStream(int64(f.pos), f.enc)
+				var err error
+				f.enc.stream, err = aesCreateCTRStream(int64(f.writeOffset), f.enc)
 				if err != nil {
-					return 0, err
+					return off, err
 				}
 			}
-			n, err = cipher.StreamWriter{S: f.enc.stream, W: f.blockWriter}.Write(b[off:])
-			// If blockWriter writes less than expected bytes,
-			// we must recreate stream chipher, since it's internal counter goes forward.
-			if n != len(b[off:]) {
-				f.enc.stream = nil
+			if cap(f.encryptedBuffer) < count {
+				f.encryptedBuffer = make([]byte, count)
 			}
-		} else {
-			n, err = f.blockWriter.Write(b[off:])
+			output := f.encryptedBuffer[:count]
+			f.enc.stream.XORKeyStream(output, part)
+			part = output
 		}
-
-		if n > 0 {
-			off += n
-			f.pos += uint64(n)
+		n, err := f.blockWriter.Write(part)
+		if f.enc != nil && n != count {
+			f.enc.stream = nil
 		}
+		off += n
+		f.writeOffset += uint64(n)
 		if err == transfer.ErrEndOfBlock {
 			err = f.startNewBlock()
 		}
-
 		if err != nil {
 			return off, err
+		}
+		if n == 0 {
+			return off, io.ErrNoProgress
 		}
 	}
 
@@ -445,23 +497,22 @@ func (f *FileWriter) writeInternal(b []byte) (int, error) {
 // a call to Flush, it is still necessary to call Close once all data has been
 // written.
 func (f *FileWriter) Flush() error {
-	// if we have buffered some data then we need to write it first
-	if f.storeInDB {
-		if len(f.smallFileBuffer) > 0 {
-			_, err := f.writeInternal(f.smallFileBuffer)
-			if err != nil {
-				f.lastError = err
-				return err
-			}
-			f.storeInDB = false
+	if f.lastError != nil {
+		return f.lastError
+	}
+	if f.closed || f.closing {
+		return io.ErrClosedPipe
+	}
+	if f.storeInDB && len(f.smallFileBuffer) > 0 {
+		if err := f.promoteSmallFile(); err != nil {
+			return f.fail(err)
 		}
 	}
 
 	if f.blockWriter != nil {
 		err := f.blockWriter.Flush()
 		if err != nil {
-			f.lastError = err
-			return err
+			return f.fail(err)
 		}
 	}
 
@@ -475,11 +526,10 @@ func (f *FileWriter) Flush() error {
 // If the datanodes have acknowledged all writes but not yet to the namenode,
 // it can return ErrReplicating (wrapped in an os.PathError). This indicates
 // that all data has been written, but the lease is still open for the file.
-// It is safe in this case to either ignore the error (and let the lease expire
-// on its own) or to call Close multiple times until it completes without an
-// error. The Java client, for context, always chooses to retry, with
-// exponential backoff.
+// Retry Close until completion, or call Abort to stop renewing the lease and
+// allow server-side recovery. Closing the Client also stops renewal.
 func (f *FileWriter) Close() error {
+	f.closing = true
 	err := f.closeInt()
 	if err != nil {
 		// if the close failed due to the DB throwing
@@ -489,11 +539,9 @@ func (f *FileWriter) Close() error {
 		if f.storeInDB && len(f.smallFileBuffer) > 0 &&
 			strings.Contains(err.Error(), "OutOfDBExtentsException") {
 
-			_, err := f.writeInternal(f.smallFileBuffer)
-			if err != nil {
-				return err
+			if err := f.promoteSmallFile(); err != nil {
+				return f.fail(err)
 			}
-			f.storeInDB = false
 
 			err = f.closeInt()
 			if err != nil {
@@ -508,51 +556,23 @@ func (f *FileWriter) Close() error {
 
 func (f *FileWriter) closeInt() error {
 	if f.lastError != nil {
-		// A failed writer can never complete the file, so, like the Java client's close, stop
-		// renewing its lease rather than keep this connection renewing for good.
-		f.releaseLease()
-		return f.lastError
+		return f.fail(f.lastError)
+	}
+	if f.closed {
+		return nil
 	}
 
-	var lastBlock *hdfs.ExtendedBlockProto = nil
-	if !f.storeInDB {
-		if f.blockWriter != nil {
-			lastBlock = f.blockWriter.Block.GetB()
-			if f.newGS != 0 {
-				// The DN finalized at the bumped GS (Java protocol).
-				// Send that GS on `complete` so the NN matches it
-				// against the BlockInfoUC that updatePipeline already
-				// updated. blockWriter.Block.B still carries the old
-				// GS because BaseHeader.Block on the wire-level
-				// writeBlock RPC must be the pre-bump value.
-				// CloudBucket must be preserved: see comment in Append()
-				// — NN's commitOrCompleteLastBlock branches on
-				// isProvidedBlock(), which keys off cloudBucket.
-				lastBlock = &hdfs.ExtendedBlockProto{
-					PoolId:          lastBlock.PoolId,
-					BlockId:         lastBlock.BlockId,
-					GenerationStamp: proto.Uint64(f.newGS),
-					NumBytes:        proto.Uint64(uint64(f.blockWriter.Offset)),
-					CloudBucket:     lastBlock.CloudBucket,
-				}
-			}
-
-			// Close the blockWriter, flushing any buffered packets.
-			err := f.closeBlock()
-			if err != nil {
-				// The block writer has dropped its datanode connection, so no retry can complete
-				// the file.
-				f.lastError = err
-				f.releaseLease()
-				return err
-			}
+	if !f.storeInDB && f.blockWriter != nil {
+		f.lastBlock = f.currentBlock()
+		if err := f.closeBlock(); err != nil {
+			return f.fail(err)
 		}
 	}
 
 	completeReq := &hdfs.CompleteRequestProto{
 		Src:        proto.String(f.name),
 		ClientName: proto.String(f.client.namenode.ClientName),
-		Last:       lastBlock,
+		Last:       f.lastBlock,
 	}
 
 	if f.storeInDB {
@@ -563,24 +583,94 @@ func (f *FileWriter) closeInt() error {
 
 	sleep := time.Duration(100)
 	for i := 0; i < 10; i++ {
-		err := f.client.namenode.Execute("complete", completeReq, completeResp)
+		err := f.execute("complete", completeReq, completeResp)
 		if err != nil {
 			return &os.PathError{Op: "create", Path: f.name, Err: interpretException(err)}
 		}
 
-		closed := *completeResp.Result
+		if completeResp.Result == nil {
+			return errors.New("missing complete response result")
+		}
+		closed := completeResp.GetResult()
 
 		if !closed { //retry after sleep
-			time.Sleep(sleep * time.Millisecond)
+			if i == 9 {
+				break
+			}
+			if err := f.waitRetry(sleep * time.Millisecond); err != nil {
+				return err
+			}
 			sleep *= 2
 			continue
 		} else {
+			f.closed = true
+			f.smallFileBuffer = nil
+			f.encryptedBuffer = nil
 			f.releaseLease()
 			return nil
 		}
 	}
 
-	return &os.PathError{Op: "create", Path: f.name, Err: errors.New("failed to close the file")}
+	return &os.PathError{Op: "create", Path: f.name, Err: ErrReplicating}
+}
+
+func (f *FileWriter) currentBlock() *hdfs.ExtendedBlockProto {
+	block := proto.Clone(f.blockWriter.Block.GetB()).(*hdfs.ExtendedBlockProto)
+	if f.newGS != 0 {
+		block.GenerationStamp = proto.Uint64(f.newGS)
+	}
+	return block
+}
+
+// Abort discards buffered data and stops renewal without completing or deleting the file.
+// Data already acknowledged by DataNodes remains subject to NameNode lease recovery.
+func (f *FileWriter) Abort() error {
+	if f.closed && f.lastError == nil {
+		return nil
+	}
+	f.fail(io.ErrClosedPipe)
+	return nil
+}
+
+func (f *FileWriter) execute(method string, request, response proto.Message) error {
+	ctx := context.Background()
+	if !f.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, f.deadline)
+		defer cancel()
+	}
+	return f.client.namenode.ExecuteContext(ctx, method, request, response)
+}
+
+func (f *FileWriter) waitRetry(delay time.Duration) error {
+	ctx := context.Background()
+	if !f.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, f.deadline)
+		defer cancel()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *FileWriter) fail(err error) error {
+	if f.lastError == nil {
+		f.lastError = err
+	}
+	if f.blockWriter != nil {
+		f.blockWriter.Abort()
+	}
+	f.smallFileBuffer = nil
+	f.encryptedBuffer = nil
+	f.closed = true
+	f.releaseLease()
+	return f.lastError
 }
 
 func (f *FileWriter) releaseLease() {
@@ -593,7 +683,7 @@ func (f *FileWriter) releaseLease() {
 func (f *FileWriter) startNewBlock() error {
 	var previous *hdfs.ExtendedBlockProto
 	if f.blockWriter != nil {
-		previous = f.blockWriter.Block.GetB()
+		previous = f.currentBlock()
 
 		// TODO: We don't actually need to wait for previous blocks to ack before
 		// continuing.
@@ -615,6 +705,8 @@ func (f *FileWriter) startNewBlock() error {
 		return err
 	}
 
+	f.newGS = 0
+	f.lastBlock = nil
 	f.blockWriter = &transfer.BlockWriter{
 		ClientName:          f.client.namenode.ClientName,
 		Block:               block,
@@ -637,10 +729,15 @@ func (f *FileWriter) addBlockWithRetry(previous *hdfs.ExtendedBlockProto) (*hdfs
 	initDelay := time.Duration(400)
 	var err error = nil
 
-	for i := 0; i < 8; i++ { // 8 --> ~9.3 min
-		err = f.client.namenode.Execute("addBlock", addBlockReq, addBlockResp)
+	for i := 0; i < 8; i++ {
+		err = f.execute("addBlock", addBlockReq, addBlockResp)
 		if err != nil && strings.Contains(err.Error(), "NotReplicatedYetException") {
-			time.Sleep(initDelay * time.Millisecond)
+			if i == 7 {
+				break
+			}
+			if waitErr := f.waitRetry(initDelay * time.Millisecond); waitErr != nil {
+				return nil, waitErr
+			}
 			initDelay *= 2
 		} else {
 			break

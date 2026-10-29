@@ -35,9 +35,9 @@ func (c *Client) mkdirWithGroup(dirname string, perm os.FileMode, createParent b
 			return nil
 		}
 
-		return &os.PathError{"mkdir", dirname, os.ErrExist}
+		return &os.PathError{Op: "mkdir", Path: dirname, Err: os.ErrExist}
 	} else if !os.IsNotExist(err) {
-		return &os.PathError{"mkdir", dirname, err}
+		return &os.PathError{Op: "mkdir", Path: dirname, Err: err}
 	}
 
 	req := &hdfs.MkdirsRequestProto{
@@ -55,7 +55,7 @@ func (c *Client) mkdirWithGroup(dirname string, perm os.FileMode, createParent b
 
 	err = c.namenode.Execute("mkdirs", req, resp)
 	if err != nil {
-		return &os.PathError{"mkdir", dirname, interpretException(err)}
+		return &os.PathError{Op: "mkdir", Path: dirname, Err: interpretException(err)}
 	}
 
 	return nil

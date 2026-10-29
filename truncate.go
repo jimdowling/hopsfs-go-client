@@ -18,7 +18,7 @@ import (
 // On HopsFS clusters with async cloud upload enabled, the NameNode rejects a
 // truncate whose target block is still uploading to the object store by
 // throwing NotReplicatedYetException. This is retried with exponential
-// backoff (~51s total budget), matching the retry shape used in the append
+// backoff (25.5 seconds of delay), matching the retry shape used in the append
 // and addBlock paths.
 func (c *Client) Truncate(name string, size int64) (bool, error) {
 	req := &hdfs.TruncateRequestProto{
@@ -30,9 +30,12 @@ func (c *Client) Truncate(name string, size int64) (bool, error) {
 
 	var err error
 	initDelay := time.Duration(100)
-	for i := 0; i < 9; i++ { // 1 min max
+	for i := 0; i < 9; i++ {
 		err = c.namenode.Execute("truncate", req, resp)
 		if err != nil && strings.Contains(err.Error(), "NotReplicatedYetException") {
+			if i == 8 {
+				break
+			}
 			time.Sleep(initDelay * time.Millisecond)
 			initDelay *= 2
 		} else {
@@ -40,9 +43,9 @@ func (c *Client) Truncate(name string, size int64) (bool, error) {
 		}
 	}
 	if err != nil {
-		return false, &os.PathError{"truncate", name, interpretException(err)}
+		return false, &os.PathError{Op: "truncate", Path: name, Err: interpretException(err)}
 	} else if resp.Result == nil {
-		return false, &os.PathError{"truncate", name, errors.New("unexpected empty response")}
+		return false, &os.PathError{Op: "truncate", Path: name, Err: errors.New("unexpected empty response")}
 	}
 
 	return resp.GetResult(), nil

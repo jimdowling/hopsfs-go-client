@@ -3,18 +3,26 @@ package transfer
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
 type aesConn struct {
-	conn net.Conn
+	conn     net.Conn
+	readMu   sync.Mutex
+	writeMu  sync.Mutex
+	writeErr error
 
 	encStream cipher.StreamWriter
 	decStream cipher.StreamReader
 }
 
 func newAesConn(conn net.Conn, inKey, outKey, inIv, outIv []byte) (net.Conn, error) {
+	if len(inIv) != aes.BlockSize || len(outIv) != aes.BlockSize {
+		return nil, fmt.Errorf("invalid AES IV length")
+	}
 	c := &aesConn{conn: conn}
 
 	encBlock, err := aes.NewCipher(inKey)
@@ -57,9 +65,21 @@ func (d *aesConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (d *aesConn) Write(b []byte) (n int, err error) {
-	return d.encStream.Write(b)
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	if d.writeErr != nil {
+		return 0, d.writeErr
+	}
+	n, err = d.encStream.Write(b)
+	if err != nil {
+		d.writeErr = err
+		d.conn.Close()
+	}
+	return n, err
 }
 
 func (d *aesConn) Read(b []byte) (n int, err error) {
+	d.readMu.Lock()
+	defer d.readMu.Unlock()
 	return d.decStream.Read(b)
 }

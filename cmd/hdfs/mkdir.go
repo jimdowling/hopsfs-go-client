@@ -21,7 +21,7 @@ func mkdir(paths []string, all bool) {
 
 	for _, p := range paths {
 		if hasGlob(p) {
-			fatal(&os.PathError{"mkdir", p, os.ErrNotExist})
+			fatal(&os.PathError{Op: "mkdir", Path: p, Err: os.ErrNotExist})
 		}
 
 		var mode = 0755 | os.ModeDir

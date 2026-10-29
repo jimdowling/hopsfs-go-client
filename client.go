@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/colinmarc/hdfs/v2/hadoopconf"
@@ -40,8 +41,12 @@ type Client struct {
 	leaderNamenode *rpc.NamenodeConnection
 	options        ClientOptions
 
-	defaults      *hdfs.FsServerDefaultsProto
-	encryptionKey *hdfs.DataEncryptionKeyProto
+	defaultsMu           sync.Mutex
+	defaultsLoading      *defaultsLoad
+	encryptionKeyMu      sync.Mutex
+	encryptionKeyLoading *encryptionKeyLoad
+	defaults             *hdfs.FsServerDefaultsProto
+	encryptionKey        *hdfs.DataEncryptionKeyProto
 
 	http *http.Client
 }
@@ -106,6 +111,8 @@ type ClientOptions struct {
 	RootCABundle      string
 	ClientCertificate string
 	ClientKey         string
+	// TLSServerName overrides the NameNode certificate identity for proxy deployments.
+	TLSServerName string
 
 	// Bounds how long connecting to a namenode may take, including the TLS and namenode handshakes.
 	// Zero selects rpc.DefaultDialTimeout; a negative value disables the limit.
@@ -117,6 +124,13 @@ type ClientOptions struct {
 	// when it is opened for reading. Zero selects rpc.DefaultMaxResponseLength (128 MB); a file of
 	// very many blocks may need more.
 	NamenodeMaxResponseLength uint32
+	// NamenodeRequestTimeout bounds RPC queueing, connection setup, and response I/O.
+	// Zero selects rpc.DefaultRequestTimeout; a negative value disables the default.
+	NamenodeRequestTimeout time.Duration
+	// KMSTimeout bounds each KMS HTTP request. Zero selects 30 seconds; negative disables it.
+	KMSTimeout time.Duration
+	// KMSMaxResponseLength bounds a KMS response body. Zero selects 1 MiB.
+	KMSMaxResponseLength int64
 
 	// skipSaslForPrivilegedDatanodePorts implements a strange edge case present
 	// in the official java client. If data.transfer.protection is set but not
@@ -207,7 +221,10 @@ func ClientOptionsFromConf(conf hadoopconf.HadoopConf) ClientOptions {
 // NewClient returns a connected Client for the given options, or an error if
 // the client could not be created.
 func NewClient(options ClientOptions) (*Client, error) {
-	client, err := newClientInt(options, options.Addresses, options.Addresses[0])
+	if len(options.Addresses) == 0 {
+		return nil, errors.New("no namenode addresses specified")
+	}
+	client, err := newClientInt(options, options.Addresses, options.Addresses)
 	if err != nil {
 		return nil, err
 	}
@@ -227,26 +244,40 @@ func NewClient(options ClientOptions) (*Client, error) {
 	// as a port-remapping service in front of the cluster, and forcing that
 	// port onto every NameNode would point the client at ports nothing
 	// listens on.
-	randNNi := rand.Intn(len(nns))
-	nnAddress := net.JoinHostPort(nns[randNNi].GetRpcIpAddress(),
-		strconv.Itoa(int(nns[randNNi].GetRpcPort())))
-	leaderNNAddress := net.JoinHostPort(nns[0].GetRpcIpAddress(),
-		strconv.Itoa(int(nns[0].GetRpcPort())))
-	newOptions := options
-	newOptions.Addresses = []string{string(nnAddress)}
-
-	_ = client.Close()
-	newClient, err := newClientInt(newOptions, []string{nnAddress}, leaderNNAddress)
-	if err != nil {
-		return nil, err
+	addresses := make([]string, 0, len(nns)+len(options.Addresses))
+	first := rand.Intn(len(nns))
+	for i := range nns {
+		node := nns[(first+i)%len(nns)]
+		addresses = append(addresses, net.JoinHostPort(node.GetRpcIpAddress(), strconv.Itoa(int(node.GetRpcPort()))))
 	}
+	for _, address := range options.Addresses {
+		found := false
+		for _, known := range addresses {
+			if known == address {
+				found = true
+				break
+			}
+		}
+		if !found {
+			addresses = append(addresses, address)
+		}
+	}
+	leader := net.JoinHostPort(nns[0].GetRpcIpAddress(), strconv.Itoa(int(nns[0].GetRpcPort())))
+	leaders := append([]string{leader}, addresses...)
+	newOptions := options
+	newOptions.Addresses = addresses
+	newClient, err := newClientInt(newOptions, addresses, leaders)
+	if err != nil {
+		return client, nil
+	}
+	_ = client.Close()
 
 	return newClient, nil
 }
 
-func newClientInt(options ClientOptions, nnAddresses []string, leaderAddress string) (*Client, error) {
+func newClientInt(options ClientOptions, nnAddresses []string, leaderAddresses []string) (*Client, error) {
 	var err error
-	if leaderAddress == "" {
+	if len(leaderAddresses) == 0 {
 		return nil, errors.New("Leader NN address is not set")
 	}
 
@@ -262,7 +293,9 @@ func newClientInt(options ClientOptions, nnAddresses []string, leaderAddress str
 
 	if options.TLS {
 		// make sure that the required paremeters are valid
-		_ = options.checkCertificates()
+		if err := options.checkCertificates(); err != nil {
+			return nil, err
+		}
 	}
 
 	nnConnectionOptions := rpc.NamenodeConnectionOptions{
@@ -275,9 +308,11 @@ func newClientInt(options ClientOptions, nnAddresses []string, leaderAddress str
 		RootCABundle:                 options.RootCABundle,
 		ClientCertificate:            options.ClientCertificate,
 		ClientKey:                    options.ClientKey,
+		TLSServerName:                options.TLSServerName,
 		DialTimeout:                  options.NamenodeDialTimeout,
 		TCPUserTimeout:               options.NamenodeTCPUserTimeout,
 		MaxResponseLength:            options.NamenodeMaxResponseLength,
+		RequestTimeout:               options.NamenodeRequestTimeout,
 	}
 
 	namenodeConn, err := rpc.NewNamenodeConnection(nnConnectionOptions)
@@ -287,23 +322,49 @@ func newClientInt(options ClientOptions, nnAddresses []string, leaderAddress str
 	}
 
 	var leaderConn *rpc.NamenodeConnection
-	leaderNNConnectionOptions := nnConnectionOptions
-	leaderNNConnectionOptions.Addresses = []string{leaderAddress}
-	leaderConn, err = rpc.NewNamenodeConnection(leaderNNConnectionOptions)
-	if err != nil {
-		return nil, err
+	var defaults *hdfs.FsServerDefaultsProto
+	if len(nnAddresses) == 1 && len(leaderAddresses) == 1 && nnAddresses[0] == leaderAddresses[0] {
+		leaderConn = namenodeConn
+	} else {
+		// HopsFS TLS readers can wait for the first RPC before admitting another
+		// connection. Complete setup without relying on an idle lease renewal.
+		response := &hdfs.GetServerDefaultsResponseProto{}
+		err = namenodeConn.Execute("getServerDefaults", &hdfs.GetServerDefaultsRequestProto{}, response)
+		if err != nil {
+			namenodeConn.Close()
+			return nil, err
+		}
+		defaults = response.GetServerDefaults()
+		leaderNNConnectionOptions := nnConnectionOptions
+		leaderNNConnectionOptions.Addresses = leaderAddresses
+		leaderConn, err = rpc.NewNamenodeConnection(leaderNNConnectionOptions)
+		if err != nil {
+			namenodeConn.Close()
+			return nil, err
+		}
 	}
 
 	// We need cookies to access KMS (required for HDFS encrypted zone).
 	jar, err := cookiejar.New(nil)
 	if err != nil {
+		namenodeConn.Close()
+		leaderConn.Close()
 		return nil, errors.New("cant create cookie jar")
 	}
 
-	// Not extending ClientOptions to preserve compatibility, so timeouts not configured.
-	httpClient := &http.Client{Jar: jar}
+	kmsTimeout := options.KMSTimeout
+	if kmsTimeout == 0 {
+		kmsTimeout = 30 * time.Second
+	} else if kmsTimeout < 0 {
+		kmsTimeout = 0
+	}
+	var transport http.RoundTripper = http.DefaultTransport
+	if base, ok := transport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+	httpClient := &http.Client{Jar: jar, Timeout: kmsTimeout, Transport: transport}
 
-	c := &Client{namenode: namenodeConn, leaderNamenode: leaderConn, options: options, http: httpClient}
+	c := &Client{namenode: namenodeConn, leaderNamenode: leaderConn, options: options, http: httpClient, defaults: defaults}
 
 	// set epoch
 	_ = c.setEpoch()
@@ -424,71 +485,107 @@ func (c *Client) CopyToRemote(src string, dst string) error {
 
 	_, err = io.Copy(remote, local)
 	if err != nil {
-		remote.Close()
+		remote.Abort()
 		return err
 	}
 
-	return remote.Close()
+	err = remote.Close()
+	if err != nil {
+		remote.Abort()
+	}
+	return err
+}
+
+type encryptionKeyLoad struct {
+	done chan struct{}
+	key  *hdfs.DataEncryptionKeyProto
+	err  error
 }
 
 func (c *Client) fetchDataEncryptionKey() (*hdfs.DataEncryptionKeyProto, error) {
-	if c.encryptionKey != nil {
-		return c.encryptionKey, nil
-	}
-
-	req := &hdfs.GetDataEncryptionKeyRequestProto{}
-	resp := &hdfs.GetDataEncryptionKeyResponseProto{}
-
-	err := c.namenode.Execute("getDataEncryptionKey", req, resp)
-	if err != nil {
-		return nil, interpretException(err)
-	}
-
-	c.encryptionKey = resp.GetDataEncryptionKey()
-	return c.encryptionKey, nil
+	return c.fetchDataEncryptionKeyContext(context.Background())
 }
 
-func (c *Client) wrapDatanodeDial(dc dialContext, token *hadoop.TokenProto) (dialContext, error) {
-	wrap := false
-	if c.options.DataTransferProtection != "" {
-		wrap = true
-	} else {
-		defaults, err := c.fetchDefaults()
+func (c *Client) fetchDataEncryptionKeyContext(ctx context.Context) (*hdfs.DataEncryptionKeyProto, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.encryptionKeyMu.Lock()
+	if key := c.encryptionKey; key != nil && key.GetExpiryDate() > uint64(time.Now().UnixMilli()) {
+		c.encryptionKeyMu.Unlock()
+		return key, nil
+	}
+	if loading := c.encryptionKeyLoading; loading != nil {
+		c.encryptionKeyMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-loading.done:
+			return loading.key, loading.err
+		}
+	}
+	loading := &encryptionKeyLoad{done: make(chan struct{})}
+	c.encryptionKeyLoading = loading
+	c.encryptionKeyMu.Unlock()
+	response := &hdfs.GetDataEncryptionKeyResponseProto{}
+	err := c.namenode.ExecuteContext(ctx, "getDataEncryptionKey", &hdfs.GetDataEncryptionKeyRequestProto{}, response)
+	c.encryptionKeyMu.Lock()
+	loading.err = interpretException(err)
+	if err == nil {
+		loading.key = response.GetDataEncryptionKey()
+		c.encryptionKey = loading.key
+	}
+	c.encryptionKeyLoading = nil
+	close(loading.done)
+	c.encryptionKeyMu.Unlock()
+	return loading.key, loading.err
+}
+
+func (c *Client) wrapDatanodeDial(base dialContext, token *hadoop.TokenProto) (dialContext, error) {
+	if base == nil {
+		base = (&net.Dialer{}).DialContext
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		protect := c.options.DataTransferProtection != ""
+		if !protect {
+			defaults, err := c.fetchDefaultsContext(ctx)
+			if err != nil {
+				return nil, err
+			}
+			protect = defaults.GetEncryptDataTransfer()
+		}
+		if !protect {
+			return base(ctx, network, address)
+		}
+		key, err := c.fetchDataEncryptionKeyContext(ctx)
 		if err != nil {
 			return nil, err
 		}
-
-		wrap = defaults.GetEncryptDataTransfer()
-	}
-
-	if wrap {
-		key, err := c.fetchDataEncryptionKey()
+		dialer := &transfer.SaslDialer{DialFunc: base, Key: key, Token: token, EnforceQop: c.options.DataTransferProtection, SkipSaslOnPrivilegedPorts: c.options.skipSaslForPrivilegedDatanodePorts}
+		conn, err := dialer.DialContext(ctx, network, address)
+		if !errors.Is(err, transfer.ErrUnknownEncryptionKey) {
+			return conn, err
+		}
+		c.encryptionKeyMu.Lock()
+		if c.encryptionKey == key {
+			c.encryptionKey = nil
+		}
+		c.encryptionKeyMu.Unlock()
+		dialer.Key, err = c.fetchDataEncryptionKeyContext(ctx)
 		if err != nil {
 			return nil, err
 		}
-
-		return (&transfer.SaslDialer{
-			DialFunc:                  dc,
-			Key:                       key,
-			Token:                     token,
-			EnforceQop:                c.options.DataTransferProtection,
-			SkipSaslOnPrivilegedPorts: c.options.skipSaslForPrivilegedDatanodePorts,
-		}).DialContext, nil
-	}
-
-	return dc, nil
+		return dialer.DialContext(ctx, network, address)
+	}, nil
 }
 
 // Close terminates all underlying socket connections to remote server.
 func (c *Client) Close() error {
-	err := c.namenode.Close()
-	if err != nil {
-		return err
+	if c.http != nil {
+		c.http.CloseIdleConnections()
 	}
-
-	err = c.leaderNamenode.Close()
-	if err != nil {
-		return err
+	if c.namenode == c.leaderNamenode {
+		return c.namenode.Close()
 	}
-	return nil
+	return errors.Join(c.namenode.Close(), c.leaderNamenode.Close())
 }

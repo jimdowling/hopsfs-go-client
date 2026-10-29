@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
+	urlpkg "net/url"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -27,7 +27,7 @@ const (
 
 func (c *Client) kmsAuth(url string) error {
 	if c.options.KerberosClient == nil {
-		url += ("&user.name=" + c.options.User)
+		url += ("&user.name=" + urlpkg.QueryEscape(c.options.User))
 	}
 
 	req, err := http.NewRequest("OPTIONS", url, nil)
@@ -125,7 +125,7 @@ func (c *Client) kmsUrl(einfo *hdfs.FileEncryptionInfoProto) ([]string, error) {
 	rand.Shuffle(len(urls), func(i, j int) { urls[i], urls[j] = urls[j], urls[i] })
 
 	for i := range urls {
-		urls[i] = urls[i] + "/v1/keyversion/" + url.QueryEscape(*einfo.EzKeyVersionName) + "/_eek?eek_op=decrypt"
+		urls[i] = urls[i] + "/v1/keyversion/" + urlpkg.QueryEscape(*einfo.EzKeyVersionName) + "/_eek?eek_op=decrypt"
 	}
 
 	return urls, nil
@@ -143,7 +143,7 @@ func (c *Client) kmsRequest(url string, requestBody []byte) ([]byte, int, error)
 	}()
 
 	var responseBody []byte
-	responseBody, err = io.ReadAll(resp.Body)
+	responseBody, err = c.readKMSBody(resp.Body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -243,4 +243,22 @@ func (c *Client) kmsGetKey(einfo *hdfs.FileEncryptionInfoProto) (*transparentEnc
 		key: key,
 		iv:  einfo.Iv,
 	}, nil
+}
+
+func (c *Client) readKMSBody(reader io.Reader) ([]byte, error) {
+	limit := c.options.KMSMaxResponseLength
+	if limit <= 0 {
+		limit = 1 << 20
+	}
+	if limit == int64(^uint64(0)>>1) {
+		return nil, errors.New("KMS response limit is too large")
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("KMS response exceeds %d byte limit", limit)
+	}
+	return body, nil
 }

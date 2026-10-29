@@ -14,18 +14,13 @@ func (c *Client) SetReplication(name string, replication int16) (bool, error) {
 }
 
 func setReplication(c *Client, name string, replication int16) (bool, error) {
-	_, err := c.getFileInfo(name)
-	if err != nil {
-		return false, &os.PathError{Op: "remove", Path: name, Err: err}
-	}
-
 	req := &hdfs.SetReplicationRequestProto{
 		Src:         proto.String(name),
 		Replication: proto.Uint32(uint32(replication)),
 	}
 	resp := &hdfs.SetReplicationResponseProto{}
 
-	err = c.leaderNamenode.Execute("setReplication", req, resp)
+	err := c.leaderNamenode.Execute("setReplication", req, resp)
 	if err != nil {
 		return false, &os.PathError{Op: "setReplication", Path: name,
 			Err: interpretException(err)}
@@ -34,5 +29,10 @@ func setReplication(c *Client, name string, replication int16) (bool, error) {
 			Err: errors.New("unexpected empty response")}
 	}
 
+	if !resp.GetResult() {
+		if _, err := c.getFileInfo(name); err != nil {
+			return false, &os.PathError{Op: "setReplication", Path: name, Err: interpretException(err)}
+		}
+	}
 	return *resp.Result, nil
 }

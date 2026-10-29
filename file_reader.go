@@ -1,6 +1,7 @@
 package hdfs
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/md5"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
+	"sync"
 	"time"
 
 	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
@@ -23,12 +26,16 @@ type FileReader struct {
 	name   string
 	info   os.FileInfo
 
+	blocksMu    sync.Mutex
+	blockIndex  int
 	blocks      []*hdfs.LocatedBlockProto
 	blockReader *transfer.BlockReader
 	deadline    time.Time
 	offset      int64
 
-	readdirLast string
+	readdirLast    string
+	readdirPending []os.FileInfo
+	readdirEOF     bool
 
 	closed bool
 
@@ -48,19 +55,19 @@ type transparentEncryptionInfo struct {
 func (c *Client) Open(name string) (*FileReader, error) {
 	info, err := c.getFileInfo(name)
 	if err != nil {
-		return nil, &os.PathError{"open", name, interpretException(err)}
+		return nil, &os.PathError{Op: "open", Path: name, Err: interpretException(err)}
 	}
 
 	status, ok := info.Sys().(*FileStatus)
 	if !ok {
-		return nil, &os.PathError{"open", name, errors.New("internal error: fail to access file status")}
+		return nil, &os.PathError{Op: "open", Path: name, Err: errors.New("internal error: fail to access file status")}
 	}
 
 	var enc *transparentEncryptionInfo
 	if status.FileEncryptionInfo != nil {
 		enc, err = c.kmsGetKey(status.FileEncryptionInfo)
 		if err != nil {
-			return nil, &os.PathError{"open", name, err}
+			return nil, &os.PathError{Op: "open", Path: name, Err: err}
 		}
 	}
 
@@ -101,19 +108,15 @@ func (f *FileReader) SetDeadline(t time.Time) error {
 // are stored alongside the data) for each block, and then calculating the MD5
 // of all of those.
 func (f *FileReader) Checksum() ([]byte, error) {
+	if f.closed {
+		return nil, io.ErrClosedPipe
+	}
 	if f.info.IsDir() {
-		return nil, &os.PathError{
-			"checksum",
-			f.name,
-			errors.New("is a directory"),
-		}
+		return nil, &os.PathError{Op: "checksum", Path: f.name, Err: errors.New("is a directory")}
 	}
 
-	if f.blocks == nil {
-		err := f.getBlocks()
-		if err != nil {
-			return nil, err
-		}
+	if err := f.getBlocks(); err != nil {
+		return nil, err
 	}
 
 	// Hadoop calculates this by writing the checksums out to a byte array, which
@@ -220,11 +223,7 @@ func (f *FileReader) Read(b []byte) (int, error) {
 	}
 
 	if f.info.IsDir() {
-		return 0, &os.PathError{
-			"read",
-			f.name,
-			errors.New("is a directory"),
-		}
+		return 0, &os.PathError{Op: "read", Path: f.name, Err: errors.New("is a directory")}
 	}
 
 	if f.offset >= f.info.Size() {
@@ -234,12 +233,12 @@ func (f *FileReader) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	if remaining := f.info.Size() - f.offset; int64(len(b)) > remaining {
+		b = b[:int(remaining)]
+	}
 
-	if f.blocks == nil {
-		err := f.getBlocks()
-		if err != nil {
-			return 0, err
-		}
+	if err := f.getBlocks(); err != nil {
+		return 0, err
 	}
 
 	for {
@@ -287,24 +286,27 @@ func (f *FileReader) ReadAt(b []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, io.ErrClosedPipe
 	}
-
 	if off < 0 {
-		return 0, &os.PathError{"readat", f.name, errors.New("negative offset")}
+		return 0, &os.PathError{Op: "readat", Path: f.name, Err: errors.New("negative offset")}
 	}
-
-	_, err := f.Seek(off, 0)
-	if err != nil {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if off >= f.info.Size() {
+		return 0, io.EOF
+	}
+	if err := f.getBlocks(); err != nil {
 		return 0, err
 	}
-
-	n, err := io.ReadFull(f, b)
-
-	// For some reason, os.File.ReadAt returns io.EOF in this case instead of
-	// io.ErrUnexpectedEOF.
+	child := &FileReader{client: f.client, name: f.name, info: f.info, blocks: f.blocks, deadline: f.deadline, offset: off}
+	if f.enc != nil {
+		child.enc = &transparentEncryptionInfo{key: f.enc.key, iv: f.enc.iv}
+	}
+	defer child.Close()
+	n, err := io.ReadFull(child, b)
 	if err == io.ErrUnexpectedEOF {
 		err = io.EOF
 	}
-
 	return n, err
 }
 
@@ -327,56 +329,50 @@ func (f *FileReader) ReadAt(b []byte, off int64) (int, error) {
 // the struct returned by Sys(). To fetch that information, make a separate
 // call to Stat.
 //
-// Note that making multiple calls to Readdir with a smallish n (as you might do
-// with the os version) is slower than just requesting everything at once.
-// That's because HDFS has no mechanism for limiting the number of entries
-// returned; whatever extra entries it returns are simply thrown away.
+// Entries from each server page are retained for subsequent calls.
 func (f *FileReader) Readdir(n int) ([]os.FileInfo, error) {
 	if f.closed {
 		return nil, io.ErrClosedPipe
 	}
 
 	if !f.info.IsDir() {
-		return nil, &os.PathError{
-			"readdir",
-			f.name,
-			errors.New("the file is not a directory"),
+		return nil, &os.PathError{Op: "readdir", Path: f.name, Err: errors.New("the file is not a directory")}
+	}
+
+	result := make([]os.FileInfo, 0)
+	for n <= 0 || len(result) < n {
+		if len(f.readdirPending) > 0 {
+			take := len(f.readdirPending)
+			if n > 0 && take > n-len(result) {
+				take = n - len(result)
+			}
+			result = append(result, f.readdirPending[:take]...)
+			f.readdirPending = f.readdirPending[take:]
+			if len(f.readdirPending) == 0 {
+				f.readdirPending = nil
+			}
+			continue
 		}
-	}
-
-	if n <= 0 {
-		f.readdirLast = ""
-	}
-
-	res := make([]os.FileInfo, 0)
-	for {
+		if f.readdirEOF {
+			break
+		}
 		batch, remaining, err := f.readdir()
 		if err != nil {
-			return nil, &os.PathError{"readdir", f.name, interpretException(err)}
+			return result, &os.PathError{Op: "readdir", Path: f.name, Err: interpretException(err)}
 		}
-
+		if len(batch) == 0 && remaining > 0 {
+			return result, &os.PathError{Op: "readdir", Path: f.name, Err: errors.New("empty listing page with remaining entries")}
+		}
 		if len(batch) > 0 {
 			f.readdirLast = batch[len(batch)-1].Name()
 		}
-
-		res = append(res, batch...)
-		if remaining == 0 || (n > 0 && len(res) >= n) {
-			break
-		}
+		f.readdirPending = batch
+		f.readdirEOF = remaining == 0
 	}
-
-	if n > 0 {
-		if len(res) == 0 {
-			return nil, io.EOF
-		}
-
-		if len(res) > n {
-			res = res[:n]
-			f.readdirLast = res[len(res)-1].Name()
-		}
+	if n > 0 && len(result) == 0 {
+		return result, io.EOF
 	}
-
-	return res, nil
+	return result, nil
 }
 
 func (f *FileReader) readdir() ([]os.FileInfo, int, error) {
@@ -421,16 +417,13 @@ func (f *FileReader) Readdirnames(n int) ([]string, error) {
 	}
 
 	fis, err := f.Readdir(n)
-	if err != nil {
-		return nil, err
-	}
 
 	names := make([]string, 0, len(fis))
 	for _, fi := range fis {
 		names = append(names, fi.Name())
 	}
 
-	return names, nil
+	return names, err
 }
 
 // Close implements io.Closer.
@@ -445,6 +438,11 @@ func (f *FileReader) Close() error {
 }
 
 func (f *FileReader) getBlocks() error {
+	f.blocksMu.Lock()
+	defer f.blocksMu.Unlock()
+	if f.blocks != nil {
+		return nil
+	}
 	req := &hdfs.GetBlockLocationsRequestProto{
 		Src:    proto.String(f.name),
 		Offset: proto.Uint64(0),
@@ -452,9 +450,15 @@ func (f *FileReader) getBlocks() error {
 	}
 	resp := &hdfs.GetBlockLocationsResponseProto{}
 
-	err := f.client.namenode.Execute("getBlockLocations", req, resp)
+	ctx := context.Background()
+	if !f.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, f.deadline)
+		defer cancel()
+	}
+	err := f.client.namenode.ExecuteContext(ctx, "getBlockLocations", req, resp)
 	if err != nil {
-		return &os.PathError{"open", f.name, interpretException(err)}
+		return &os.PathError{Op: "open", Path: f.name, Err: interpretException(err)}
 	}
 
 	f.blocks = resp.GetLocations().GetBlocks()
@@ -463,7 +467,18 @@ func (f *FileReader) getBlocks() error {
 
 func (f *FileReader) getNewBlockReader() error {
 	off := uint64(f.offset)
-	for _, block := range f.blocks {
+	index := f.blockIndex
+	if index >= len(f.blocks) || !(f.blocks[index].GetOffset() <= off && off < f.blocks[index].GetOffset()+f.blocks[index].GetB().GetNumBytes()) {
+		next := index + 1
+		if next < len(f.blocks) && f.blocks[next].GetOffset() <= off && off < f.blocks[next].GetOffset()+f.blocks[next].GetB().GetNumBytes() {
+			index = next
+		} else {
+			index = sort.Search(len(f.blocks), func(i int) bool { return f.blocks[i].GetOffset()+f.blocks[i].GetB().GetNumBytes() > off })
+		}
+	}
+	if index < len(f.blocks) {
+		block := f.blocks[index]
+		f.blockIndex = index
 		start := block.GetOffset()
 		end := start + block.GetB().GetNumBytes()
 
@@ -500,7 +515,7 @@ func (f *FileReader) GetPos() uint64 {
 // this is how it is in Java API
 func (f *FileReader) Available() int32 {
 	available := f.info.Size() - f.offset
-	if available <= math.MaxInt {
+	if available <= math.MaxInt32 {
 		return int32(available)
 	} else {
 		return math.MaxInt32

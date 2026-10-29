@@ -27,6 +27,12 @@ test: hdfs
 	go test -v -race -timeout 60s ./...
 	bats ./cmd/hdfs/test/*.bats
 
+unit-test:
+	go test -race -timeout 60s ./internal/... ./hadoopconf/...
+	go test -race -timeout 60s -run '^Test(Protocol|DirectoryIteration|ParallelReadAt|WrappedHops|KMS|EncryptionKey|AFailedWriter|AesIV|KmsParseProviderUri)' .
+	go test -run '^$$' ./cmd/hdfs
+	go vet ./...
+
 clean:
 	rm -f ./hdfs
 	rm -rf gohdfs-*
@@ -36,4 +42,4 @@ release: hdfs
 	cp hdfs README.md LICENSE.txt cmd/hdfs/bash_completion $(RELEASE_NAME)/
 	tar -cvzf $(RELEASE_NAME).tar.gz $(RELEASE_NAME)
 
-.PHONY: clean clean-protos install test release
+.PHONY: clean clean-protos install test unit-test release

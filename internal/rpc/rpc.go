@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"time"
 
+	hadoop "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -96,27 +97,29 @@ func readRPCPacket(r io.Reader, maxLength uint32, msgs ...proto.Message) error {
 		return err
 	}
 
-	for _, msg := range msgs {
+	for i, msg := range msgs {
 		// HDFS doesn't send all the response messages all the time (for example, if
 		// the RpcResponseHeaderProto contains an error).
 		if len(packet) == 0 {
-			return nil
+			if i > 0 {
+				if header, ok := msgs[0].(*hadoop.RpcResponseHeaderProto); ok && header.GetStatus() != hadoop.RpcResponseHeaderProto_SUCCESS {
+					return nil
+				}
+			}
+			return errInvalidResponse
 		}
 
 		msgLength, n := binary.Uvarint(packet)
-		if n <= 0 || msgLength > uint64(len(packet)) {
+		if n <= 0 || msgLength > uint64(len(packet)-n) {
 			return errInvalidResponse
 		}
 
 		packet = packet[n:]
-		if msgLength != 0 {
-			err = proto.Unmarshal(packet[:msgLength], msg)
-			if err != nil {
-				return err
-			}
-
-			packet = packet[msgLength:]
+		err = proto.Unmarshal(packet[:msgLength], msg)
+		if err != nil {
+			return err
 		}
+		packet = packet[msgLength:]
 	}
 
 	if len(packet) > 0 {

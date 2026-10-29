@@ -24,7 +24,7 @@ func cat(paths []string) {
 		if err != nil {
 			fatal(err)
 		} else if file.Stat().IsDir() {
-			fatal(&os.PathError{"cat", p, errors.New("file is a directory")})
+			fatal(&os.PathError{Op: "cat", Path: p, Err: errors.New("file is a directory")})
 		}
 
 		readers = append(readers, file)
@@ -52,7 +52,7 @@ func printSection(paths []string, numLines, numBytes int64, fromEnd bool) {
 		file, err := client.Open(p)
 		if err != nil || file.Stat().IsDir() {
 			if err == nil && file.Stat().IsDir() {
-				err = &os.PathError{"open", p, errors.New("file is a directory")}
+				err = &os.PathError{Op: "open", Path: p, Err: errors.New("file is a directory")}
 			}
 
 			fmt.Fprintln(os.Stderr, err)

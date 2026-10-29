@@ -22,7 +22,7 @@ func (c *Client) ListXAttrs(name string) (map[string]string, error) {
 
 	err := c.namenode.Execute("listXAttrs", req, resp)
 	if err != nil {
-		return nil, &os.PathError{"list xattrs", name, interpretException(err)}
+		return nil, &os.PathError{Op: "list xattrs", Path: name, Err: interpretException(err)}
 	}
 
 	return xattrMap(resp.GetXAttrs()), nil
@@ -39,7 +39,7 @@ func (c *Client) GetXAttrs(name string, keys ...string) (map[string]string, erro
 	for _, key := range keys {
 		ns, rest, err := splitKey(key)
 		if err != nil {
-			return nil, &os.PathError{"get xattrs", name, err}
+			return nil, &os.PathError{Op: "get xattrs", Path: name, Err: err}
 		}
 
 		req.XAttrs = append(req.XAttrs, &hdfs.XAttrProto{
@@ -52,10 +52,10 @@ func (c *Client) GetXAttrs(name string, keys ...string) (map[string]string, erro
 	err := c.namenode.Execute("getXAttrs", req, resp)
 	if err != nil {
 		if isKeyNotFound(err) {
-			return nil, &os.PathError{"get xattrs", name, errXAttrKeysNotFound}
+			return nil, &os.PathError{Op: "get xattrs", Path: name, Err: errXAttrKeysNotFound}
 		}
 
-		return nil, &os.PathError{"get xattrs", name, interpretException(err)}
+		return nil, &os.PathError{Op: "get xattrs", Path: name, Err: interpretException(err)}
 	}
 
 	return xattrMap(resp.GetXAttrs()), nil
@@ -68,7 +68,7 @@ func (c *Client) SetXAttr(name, key, value string) error {
 
 	ns, rest, err := splitKey(key)
 	if err != nil {
-		return &os.PathError{"set xattr", name, err}
+		return &os.PathError{Op: "set xattr", Path: name, Err: err}
 	}
 
 	req := &hdfs.SetXAttrRequestProto{
@@ -83,7 +83,7 @@ func (c *Client) SetXAttr(name, key, value string) error {
 
 	err = c.namenode.Execute("setXAttr", req, resp)
 	if err != nil {
-		return &os.PathError{"set xattr", name, interpretException(err)}
+		return &os.PathError{Op: "set xattr", Path: name, Err: interpretException(err)}
 	}
 
 	return nil
@@ -94,7 +94,7 @@ func (c *Client) SetXAttr(name, key, value string) error {
 func (c *Client) RemoveXAttr(name, key string) error {
 	ns, rest, err := splitKey(key)
 	if err != nil {
-		return &os.PathError{"remove xattr", name, err}
+		return &os.PathError{Op: "remove xattr", Path: name, Err: err}
 	}
 
 	req := &hdfs.RemoveXAttrRequestProto{
@@ -109,10 +109,10 @@ func (c *Client) RemoveXAttr(name, key string) error {
 	err = c.namenode.Execute("removeXAttr", req, resp)
 	if err != nil {
 		if isKeyNotFound(err) {
-			return &os.PathError{"remove xattr", name, errXAttrKeysNotFound}
+			return &os.PathError{Op: "remove xattr", Path: name, Err: errXAttrKeysNotFound}
 		}
 
-		return &os.PathError{"remove xattr", name, interpretException(err)}
+		return &os.PathError{Op: "remove xattr", Path: name, Err: interpretException(err)}
 	}
 
 	return nil

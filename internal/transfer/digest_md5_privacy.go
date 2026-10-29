@@ -2,7 +2,7 @@ package transfer
 
 import (
 	"bytes"
-	"crypto/hmac"
+	hmacpkg "crypto/hmac"
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/binary"
@@ -10,13 +10,16 @@ import (
 	"hash"
 	"io"
 	"net"
-	"syscall"
+	"sync"
 	"time"
 )
 
 type digestMD5PrivacyConn struct {
-	conn         net.Conn
-	readDeadline time.Time
+	readMu   sync.Mutex
+	writeMu  sync.Mutex
+	readErr  error
+	writeErr error
+	conn     net.Conn
 
 	sendSeqNum int
 	readSeqNum int
@@ -41,8 +44,8 @@ func newDigestMD5PrivacyConn(conn net.Conn, kic, kis, kcc, kcs []byte) digestMD5
 		conn:      conn,
 		encryptor: encryptor,
 		decryptor: decryptor,
-		decodeMAC: hmac.New(md5.New, kis),
-		encodeMAC: hmac.New(md5.New, kic),
+		decodeMAC: hmacpkg.New(md5.New, kis),
+		encodeMAC: hmacpkg.New(md5.New, kic),
 	}
 }
 
@@ -59,12 +62,10 @@ func (d *digestMD5PrivacyConn) RemoteAddr() net.Addr {
 }
 
 func (d *digestMD5PrivacyConn) SetDeadline(t time.Time) error {
-	d.readDeadline = t
 	return d.conn.SetDeadline(t)
 }
 
 func (d *digestMD5PrivacyConn) SetReadDeadline(t time.Time) error {
-	d.readDeadline = t
 	return d.conn.SetReadDeadline(t)
 }
 
@@ -73,40 +74,41 @@ func (d *digestMD5PrivacyConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (d *digestMD5PrivacyConn) Read(b []byte) (int, error) {
-	if !d.readDeadline.IsZero() && d.readDeadline.Before(time.Now()) {
-		return 0, syscall.ETIMEDOUT
+	d.readMu.Lock()
+	defer d.readMu.Unlock()
+	if d.readErr != nil {
+		return 0, d.readErr
 	}
-
-	n, err := d.readBuf.Read(b)
-	if len(b) == n || (err != nil && err != io.EOF) {
-		return n, err
+	if len(b) == 0 {
+		return 0, nil
 	}
-
-	var sz int32
-	err = binary.Read(d.conn, binary.BigEndian, &sz)
-	if err != nil {
-		return 0, err
+	if d.readBuf.Len() > 0 {
+		return d.readBuf.Read(b)
 	}
-
-	d.readBuf.Reset()
-	d.readBuf.Grow(int(sz))
-	_, err = io.CopyN(&d.readBuf, d.conn, int64(sz))
-	if err != nil {
-		return n, err
+	for {
+		if err := readSASLFrame(d.conn, &d.readBuf); err != nil {
+			d.readBuf.Reset()
+			d.readErr = err
+			d.conn.Close()
+			return 0, err
+		}
+		decoded, err := d.decode(d.readBuf.Bytes())
+		if err != nil {
+			d.readBuf.Reset()
+			d.readErr = err
+			d.conn.Close()
+			return 0, err
+		}
+		d.readBuf.Truncate(len(decoded))
+		if len(decoded) > 0 {
+			return d.readBuf.Read(b)
+		}
 	}
-
-	decoded, err := d.decode(d.readBuf.Bytes())
-	if err != nil {
-		return n, err
-	}
-
-	d.readBuf.Truncate(len(decoded))
-	return d.readBuf.Read(b[n:])
 }
 
 func (d *digestMD5PrivacyConn) decode(input []byte) (out []byte, err error) {
 	inputLen := len(input)
-	if inputLen < saslIntegrityPrefixLength {
+	if inputLen < saslIntegrityTrailerLength {
 		return nil, errors.New("invalid response from datanode: bad response length")
 	}
 
@@ -125,7 +127,7 @@ func (d *digestMD5PrivacyConn) decode(input []byte) (out []byte, err error) {
 	msgType := input[msgTypeStart : msgTypeStart+macMsgTypeLen]
 	seqNum := input[seqNumStart : seqNumStart+macSeqNumLen]
 
-	if !bytes.Equal(hmac, origHash) || !bytes.Equal(macMsgType[:], msgType) || !bytes.Equal(seqNum, seqBuf[:]) {
+	if !hmacpkg.Equal(hmac, origHash) || !bytes.Equal(macMsgType[:], msgType) || !bytes.Equal(seqNum, seqBuf[:]) {
 		return nil, errors.New("invalid response from datanode: HMAC check failed")
 	}
 
@@ -134,7 +136,15 @@ func (d *digestMD5PrivacyConn) decode(input []byte) (out []byte, err error) {
 }
 
 func (d *digestMD5PrivacyConn) Write(b []byte) (int, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	if d.writeErr != nil {
+		return 0, d.writeErr
+	}
 	inputLen := len(b)
+	if inputLen > maxDataTransferMessageLength-saslIntegrityTrailerLength {
+		return 0, errInvalidResponse
+	}
 	seqBuf := lenEncodeBytes(d.sendSeqNum)
 
 	encryptedLen := inputLen + macHMACLen
@@ -156,5 +166,15 @@ func (d *digestMD5PrivacyConn) Write(b []byte) (int, error) {
 
 	d.sendSeqNum++
 	n, err := d.writeBuf.WriteTo(d.conn)
-	return int(n), err
+	if err != nil {
+		d.writeErr = err
+		d.conn.Close()
+		return 0, err
+	}
+	if int(n) != outputLen {
+		d.writeErr = io.ErrShortWrite
+		d.conn.Close()
+		return 0, io.ErrShortWrite
+	}
+	return inputLen, nil
 }

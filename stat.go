@@ -22,7 +22,7 @@ type FileStatus = hdfs.HdfsFileStatusProto
 func (c *Client) Stat(name string) (os.FileInfo, error) {
 	fi, err := c.getFileInfo(name)
 	if err != nil {
-		err = &os.PathError{"stat", name, interpretException(err)}
+		err = &os.PathError{Op: "stat", Path: name, Err: interpretException(err)}
 	}
 
 	return fi, err

@@ -41,7 +41,11 @@ func (cr *ChecksumReader) ReadChecksum() ([]byte, error) {
 		datanodes := make([]string, len(locs))
 		for i, loc := range locs {
 			dn := loc.GetId()
-			datanodes[i] = getDatanodeAddress(dn, cr.UseDatanodeHostname)
+			var err error
+			datanodes[i], err = getDatanodeAddress(dn, cr.UseDatanodeHostname)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		cr.datanodes = newDatanodeFailover(datanodes)
@@ -59,11 +63,10 @@ func (cr *ChecksumReader) ReadChecksum() ([]byte, error) {
 	}
 
 	err := cr.datanodes.lastError()
-	if err != nil {
-		err = fmt.Errorf("No available datanodes for block: %w", err)
+	if err == nil {
+		err = errInvalidResponse
 	}
-
-	return nil, err
+	return nil, fmt.Errorf("no available datanodes for block: %w", err)
 }
 
 func (cr *ChecksumReader) readChecksum(address string) ([]byte, error) {
@@ -71,16 +74,22 @@ func (cr *ChecksumReader) readChecksum(address string) ([]byte, error) {
 		cr.DialFunc = (&net.Dialer{}).DialContext
 	}
 
-	conn, err := cr.DialFunc(context.Background(), "tcp", address)
+	ctx := context.Background()
+	if !cr.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, cr.deadline)
+		defer cancel()
+	}
+	conn, err := cr.DialFunc(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
 	err = conn.SetDeadline(cr.deadline)
 	if err != nil {
 		return nil, err
 	}
-
 	err = cr.writeBlockChecksumRequest(conn)
 	if err != nil {
 		return nil, err
@@ -89,6 +98,12 @@ func (cr *ChecksumReader) readChecksum(address string) ([]byte, error) {
 	resp, err := cr.readBlockChecksumResponse(conn)
 	if err != nil {
 		return nil, err
+	}
+	if resp.GetStatus() != hdfs.Status_SUCCESS {
+		return nil, fmt.Errorf("checksum failed: %s (%s)", resp.GetStatus(), resp.GetMessage())
+	}
+	if resp.GetChecksumResponse() == nil || len(resp.GetChecksumResponse().GetBlockChecksum()) != 16 {
+		return nil, errInvalidResponse
 	}
 
 	return resp.GetChecksumResponse().GetBlockChecksum(), nil

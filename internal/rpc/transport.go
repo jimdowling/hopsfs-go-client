@@ -21,6 +21,7 @@ type basicTransport struct {
 	clientID []byte
 	// maxResponseLength bounds one response; zero selects DefaultMaxResponseLength.
 	maxResponseLength uint32
+	epoch             func() int64
 }
 
 // writeRequest writes an RPC message.
@@ -37,6 +38,9 @@ type basicTransport struct {
 // +-----------------------------------------------------------+
 func (t *basicTransport) writeRequest(w io.Writer, method string, requestID int32, req proto.Message) error {
 	rrh := newRPCRequestHeader(requestID, t.clientID)
+	if t.epoch != nil {
+		rrh.Epoch = proto.Int64(t.epoch())
+	}
 	rh := newRequestHeader(method)
 
 	reqBytes, err := makeRPCPacket(rrh, rh, req)
@@ -67,6 +71,7 @@ func (t *basicTransport) readResponse(r io.Reader, method string, requestID int3
 		return errUnexpectedSequenceNumber
 	} else if rrh.GetStatus() != hadoop.RpcResponseHeaderProto_SUCCESS {
 		return &NamenodeError{
+			fatal:     rrh.GetStatus() == hadoop.RpcResponseHeaderProto_FATAL,
 			method:    method,
 			message:   rrh.GetErrorMsg(),
 			code:      int(rrh.GetErrorDetail()),

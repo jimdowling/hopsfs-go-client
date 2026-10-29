@@ -1,7 +1,6 @@
 package hdfs
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 )
@@ -16,11 +15,8 @@ func (c *Client) Walk(root string, walkFn filepath.WalkFunc) error {
 }
 
 func (c *Client) walk(path string, walkFn filepath.WalkFunc) error {
-	file, err := c.Open(path)
-	var info os.FileInfo
-	if file != nil {
-		info = file.Stat()
-	}
+	info, err := c.getFileInfo(path)
+	err = interpretException(err)
 
 	err = walkFn(path, info, err)
 	if err != nil {
@@ -35,6 +31,7 @@ func (c *Client) walk(path string, walkFn filepath.WalkFunc) error {
 		return nil
 	}
 
+	file := &FileReader{client: c, name: path, info: info}
 	names, err := file.Readdirnames(0)
 	if err != nil {
 		return walkFn(path, info, err)

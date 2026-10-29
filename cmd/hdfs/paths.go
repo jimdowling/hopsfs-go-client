@@ -148,7 +148,7 @@ func expandPaths(client *hdfs.Client, paths []string) ([]string, error) {
 				return nil, err
 			} else if len(expanded) == 0 {
 				// Fake a PathError for consistency.
-				return nil, &os.PathError{"stat", p, os.ErrNotExist}
+				return nil, &os.PathError{Op: "stat", Path: p, Err: os.ErrNotExist}
 			}
 
 			res = append(res, expanded...)

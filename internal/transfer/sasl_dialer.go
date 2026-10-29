@@ -21,6 +21,8 @@ const (
 	authProtocol  = "hdfs"
 )
 
+var ErrUnknownEncryptionKey = errors.New("datanode rejected data encryption key")
+
 // SaslDialer dials using the underlying DialFunc, then negotiates
 // authentication with the datanode. The resulting Conn implements whatever
 // data protection level is specified by the server, whether it be wire
@@ -42,24 +44,54 @@ func (d *SaslDialer) DialContext(ctx context.Context, network, addr string) (net
 	if err != nil {
 		return nil, err
 	}
+	connected := false
+	finished := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-finished:
+		}
+	}()
+	defer func() { close(finished); <-watcherDone }()
+	defer func() {
+		if !connected {
+			conn.Close()
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
 
 	// If the port is privileged, and a certain combination of configuration
 	// variables are set, hadoop expects us to skip SASL negotiation. See the
 	// documentation for ClientOptions in the top-level package for more detail.
 	if d.SkipSaslOnPrivilegedPorts {
 		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok && addr.Port < 1024 {
+			connected = true
 			return conn, nil
 		}
 
 	}
 
-	return d.wrapDatanodeConn(conn)
+	wrapped, err := d.wrapDatanodeConn(conn)
+	if err != nil {
+		return nil, err
+	}
+	connected = true
+	return wrapped, nil
 }
 
 // wrapDatanodeConn performs a shortened SASL negotiation with the datanode,
 // then returns a wrapped connection or any error encountered. In the case of
 // a protection setting of 'authentication', the bare connection is returned.
 func (d *SaslDialer) wrapDatanodeConn(conn net.Conn) (net.Conn, error) {
+	if d.Token == nil {
+		return nil, errors.New("missing datanode token")
+	}
 	auth := &hadoop.RpcSaslProto_SaslAuth{}
 	auth.Method = proto.String(authMethod)
 	auth.Mechanism = proto.String(authMechanism)
@@ -117,6 +149,9 @@ func (d *SaslDialer) wrapDatanodeConn(conn net.Conn) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := dataTransferStatus(msg); err != nil {
+		return nil, err
+	}
 
 	challengeResponse, err := dgst.challengeStep1(msg.Payload)
 	if err != nil {
@@ -169,6 +204,9 @@ func (d *SaslDialer) wrapDatanodeConn(conn net.Conn) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := dataTransferStatus(resp); err != nil {
+		return nil, err
+	}
 
 	err = dgst.challengeStep2(resp.Payload)
 	if err != nil {
@@ -217,4 +255,15 @@ func (d *SaslDialer) wrapDatanodeConn(conn net.Conn) (net.Conn, error) {
 	}
 
 	return wrapped, nil
+}
+
+func dataTransferStatus(message *hdfs.DataTransferEncryptorMessageProto) error {
+	switch message.GetStatus() {
+	case hdfs.DataTransferEncryptorMessageProto_SUCCESS:
+		return nil
+	case hdfs.DataTransferEncryptorMessageProto_ERROR_UNKNOWN_KEY:
+		return fmt.Errorf("%w: %s", ErrUnknownEncryptionKey, message.GetMessage())
+	default:
+		return fmt.Errorf("datanode authentication failed: %s", message.GetMessage())
+	}
 }

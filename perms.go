@@ -18,7 +18,7 @@ func (c *Client) Chmod(name string, perm os.FileMode) error {
 
 	err := c.namenode.Execute("setPermission", req, resp)
 	if err != nil {
-		return &os.PathError{"chmod", name, interpretException(err)}
+		return &os.PathError{Op: "chmod", Path: name, Err: interpretException(err)}
 	}
 
 	return nil
@@ -39,7 +39,7 @@ func (c *Client) Chown(name string, user, group string) error {
 
 	err := c.namenode.Execute("setOwner", req, resp)
 	if err != nil {
-		return &os.PathError{"chown", name, interpretException(err)}
+		return &os.PathError{Op: "chown", Path: name, Err: interpretException(err)}
 	}
 
 	return nil
@@ -56,7 +56,7 @@ func (c *Client) Chtimes(name string, atime time.Time, mtime time.Time) error {
 
 	err := c.namenode.Execute("setTimes", req, resp)
 	if err != nil {
-		return &os.PathError{"chtimes", name, interpretException(err)}
+		return &os.PathError{Op: "chtimes", Path: name, Err: interpretException(err)}
 	}
 
 	return nil

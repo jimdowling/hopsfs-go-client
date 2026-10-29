@@ -13,6 +13,7 @@ import (
 	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
 	"github.com/jcmturner/gokrb5/v8/spnego"
 	krbtypes "github.com/jcmturner/gokrb5/v8/types"
+	"google.golang.org/protobuf/proto"
 )
 
 const saslRpcCallId = -33
@@ -75,6 +76,7 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 				basicTransport: basicTransport{
 					clientID:          c.ClientID,
 					maxResponseLength: c.maxResponseLength,
+					epoch:             c.epochSec,
 				},
 				sessionKey: sessionKey,
 				privacy:    qop == sasl.QopPrivacy,
@@ -140,6 +142,7 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 
 func (c *NamenodeConnection) writeSaslRequest(req *hadoop.RpcSaslProto) error {
 	rrh := newRPCRequestHeader(saslRpcCallId, c.ClientID)
+	rrh.Epoch = proto.Int64(c.epochSec())
 	packet, err := makeRPCPacket(rrh, req)
 	if err != nil {
 		return err

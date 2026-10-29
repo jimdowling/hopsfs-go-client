@@ -71,6 +71,7 @@ func (t *saslTransport) readResponse(r io.Reader, method string, requestID int32
 		return errUnexpectedSequenceNumber
 	} else if rrh.GetStatus() != hadoop.RpcResponseHeaderProto_SUCCESS {
 		return &NamenodeError{
+			fatal:     rrh.GetStatus() == hadoop.RpcResponseHeaderProto_FATAL,
 			method:    method,
 			message:   rrh.GetErrorMsg(),
 			code:      int(rrh.GetErrorDetail()),

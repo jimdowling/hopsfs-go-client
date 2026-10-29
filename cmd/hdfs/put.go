@@ -41,7 +41,7 @@ func putFromStdin(client *hdfs.Client, dest string, overwrite bool) {
 	// If the destination exists, regardless of what it is, bail out.
 	_, err := client.Stat(dest)
 	if err == nil {
-		fatal(&os.PathError{"put", dest, os.ErrExist})
+		fatal(&os.PathError{Op: "put", Path: dest, Err: os.ErrExist})
 	} else if !os.IsNotExist(err) {
 		fatal(err)
 	}
@@ -78,7 +78,7 @@ func putFromFile(client *hdfs.Client, source string, dest string, overwrite bool
 			dest = path.Join(dest, filepath.Base(source))
 		} else {
 			if !overwrite {
-				fatal(&os.PathError{"put", dest, os.ErrExist})
+				fatal(&os.PathError{Op: "put", Path: dest, Err: os.ErrExist})
 			}
 		}
 	} else if !os.IsNotExist(err) {

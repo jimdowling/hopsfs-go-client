@@ -29,7 +29,7 @@ func rm(paths []string, recursive bool, force bool) {
 		}
 
 		if !recursive && info.IsDir() {
-			fmt.Fprintln(os.Stderr, &os.PathError{"remove", p, errors.New("file is a directory")})
+			fmt.Fprintln(os.Stderr, &os.PathError{Op: "remove", Path: p, Err: errors.New("file is a directory")})
 			status = 1
 			continue
 		}

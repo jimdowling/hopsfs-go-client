@@ -2,7 +2,7 @@ package transfer
 
 import (
 	"bytes"
-	"crypto/hmac"
+	hmacpkg "crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
@@ -10,15 +10,18 @@ import (
 	"hash"
 	"io"
 	"net"
-	"syscall"
+	"sync"
 	"time"
 )
 
 // digestMD5IntegrityConn returns a net.Conn wrapper that peforms md5-digest
 // integrity checks on data passing over it.
 type digestMD5IntegrityConn struct {
-	conn         net.Conn
-	readDeadline time.Time
+	readMu   sync.Mutex
+	writeMu  sync.Mutex
+	readErr  error
+	writeErr error
+	conn     net.Conn
 
 	readBuf  bytes.Buffer
 	writeBuf bytes.Buffer
@@ -33,8 +36,8 @@ type digestMD5IntegrityConn struct {
 func newDigestMD5IntegrityConn(conn net.Conn, kic, kis []byte) digestMD5Conn {
 	return &digestMD5IntegrityConn{
 		conn:      conn,
-		encodeMAC: hmac.New(md5.New, kic),
-		decodeMAC: hmac.New(md5.New, kis),
+		encodeMAC: hmacpkg.New(md5.New, kic),
+		decodeMAC: hmacpkg.New(md5.New, kis),
 	}
 }
 
@@ -51,12 +54,10 @@ func (d *digestMD5IntegrityConn) RemoteAddr() net.Addr {
 }
 
 func (d *digestMD5IntegrityConn) SetDeadline(t time.Time) error {
-	d.readDeadline = t
 	return d.conn.SetDeadline(t)
 }
 
 func (d *digestMD5IntegrityConn) SetReadDeadline(t time.Time) error {
-	d.readDeadline = t
 	return d.conn.SetReadDeadline(t)
 }
 
@@ -65,7 +66,15 @@ func (d *digestMD5IntegrityConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (d *digestMD5IntegrityConn) Write(b []byte) (n int, err error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	if d.writeErr != nil {
+		return 0, d.writeErr
+	}
 	inputLen := len(b)
+	if inputLen > maxDataTransferMessageLength-saslIntegrityTrailerLength {
+		return 0, errInvalidResponse
+	}
 	seqBuf := lenEncodeBytes(d.sendSeqNum)
 	outputLen := macDataLen + inputLen + macHMACLen + macMsgTypeLen + macSeqNumLen
 
@@ -82,41 +91,52 @@ func (d *digestMD5IntegrityConn) Write(b []byte) (n int, err error) {
 
 	d.sendSeqNum++
 	wr, err := d.writeBuf.WriteTo(d.conn)
-	return int(wr), err
+	if err != nil {
+		d.writeErr = err
+		d.conn.Close()
+		return 0, err
+	}
+	if int(wr) != outputLen {
+		d.writeErr = io.ErrShortWrite
+		d.conn.Close()
+		return 0, io.ErrShortWrite
+	}
+	return inputLen, nil
 }
 
 // Read will decode the underlying bytes and then copy them from our
 // buffer into the provided byte slice
 func (d *digestMD5IntegrityConn) Read(b []byte) (int, error) {
-	if !d.readDeadline.IsZero() && d.readDeadline.Before(time.Now()) {
-		return 0, syscall.ETIMEDOUT
+	d.readMu.Lock()
+	defer d.readMu.Unlock()
+	if d.readErr != nil {
+		return 0, d.readErr
 	}
-
-	n, err := d.readBuf.Read(b)
-	if len(b) == n || (err != nil && err != io.EOF) {
-		return n, err
+	if len(b) == 0 {
+		return 0, nil
 	}
-
-	var sz int32
-	err = binary.Read(d.conn, binary.BigEndian, &sz)
-	if err != nil {
-		return n, err
+	if d.readBuf.Len() > 0 {
+		return d.readBuf.Read(b)
 	}
-
-	d.readBuf.Reset()
-	d.readBuf.Grow(int(sz))
-	_, err = io.CopyN(&d.readBuf, d.conn, int64(sz))
-	if err != nil {
-		return n, err
+	for {
+		if err := readSASLFrame(d.conn, &d.readBuf); err != nil {
+			d.readBuf.Reset()
+			d.readErr = err
+			d.conn.Close()
+			return 0, err
+		}
+		decoded, err := d.decode(d.readBuf.Bytes())
+		if err != nil {
+			d.readBuf.Reset()
+			d.readErr = err
+			d.conn.Close()
+			return 0, err
+		}
+		d.readBuf.Truncate(len(decoded))
+		if len(decoded) > 0 {
+			return d.readBuf.Read(b)
+		}
 	}
-
-	decoded, err := d.decode(d.readBuf.Bytes())
-	if err != nil {
-		return n, err
-	}
-
-	d.readBuf.Truncate(len(decoded))
-	return d.readBuf.Read(b[n:])
 }
 
 // decode will decode a message from the server and perform the integrity
@@ -125,7 +145,7 @@ func (d *digestMD5IntegrityConn) Read(b []byte) (int, error) {
 // copied to a new slice before calling decode again
 func (d *digestMD5IntegrityConn) decode(input []byte) ([]byte, error) {
 	inputLen := len(input)
-	if inputLen < saslIntegrityPrefixLength {
+	if inputLen < saslIntegrityTrailerLength {
 		return nil, fmt.Errorf("Input length smaller than the integrity prefix")
 	}
 
@@ -138,7 +158,7 @@ func (d *digestMD5IntegrityConn) decode(input []byte) ([]byte, error) {
 	msgTypeStart := seqNumStart - macMsgTypeLen
 	origHashStart := msgTypeStart - macHMACLen
 
-	if !bytes.Equal(hmac, input[origHashStart:origHashStart+macHMACLen]) ||
+	if !hmacpkg.Equal(hmac, input[origHashStart:origHashStart+macHMACLen]) ||
 		!bytes.Equal(macMsgType[:], input[msgTypeStart:msgTypeStart+macMsgTypeLen]) ||
 		!bytes.Equal(seqBuf[:], input[seqNumStart:seqNumStart+macSeqNumLen]) {
 		return nil, errors.New("HMAC Integrity Check failed")
@@ -150,7 +170,7 @@ func (d *digestMD5IntegrityConn) decode(input []byte) ([]byte, error) {
 
 // msgHMAC implements the HMAC wrapper per the RFC:
 //
-//     HMAC(ki, {seqnum, msg})[0..9].
+//	HMAC(ki, {seqnum, msg})[0..9].
 func msgHMAC(mac hash.Hash, seq [4]byte, msg []byte) []byte {
 	mac.Reset()
 	mac.Write(seq[:])

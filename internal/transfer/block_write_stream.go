@@ -60,6 +60,10 @@ type blockWriteStream struct {
 	seqno   int
 
 	ackError        error
+	errMu           sync.Mutex
+	stopOnce        sync.Once
+	packetsOnce     sync.Once
+	heartbeatsDone  chan struct{}
 	acksDone        chan struct{}
 	lastPacketSeqno int
 
@@ -89,12 +93,13 @@ var ErrInvalidSeqno = errors.New("invalid ack sequence number")
 
 func newBlockWriteStream(conn io.ReadWriter, offset int64) *blockWriteStream {
 	s := &blockWriteStream{
-		conn:       conn,
-		offset:     offset,
-		seqno:      1,
-		packets:    make(chan int, maxPacketsInQueue),
-		acksDone:   make(chan struct{}),
-		heartbeats: make(chan struct{}),
+		conn:           conn,
+		offset:         offset,
+		seqno:          1,
+		packets:        make(chan int, maxPacketsInQueue),
+		acksDone:       make(chan struct{}),
+		heartbeats:     make(chan struct{}),
+		heartbeatsDone: make(chan struct{}),
 	}
 
 	// Send idle heartbeats every 30 seconds.
@@ -109,20 +114,6 @@ func newBlockWriteStream(conn io.ReadWriter, offset int64) *blockWriteStream {
 	return s
 }
 
-// func newBlockWriteStreamForRecovery(conn io.ReadWriter, oldWriteStream *blockWriteStream) {
-// 	s := &blockWriteStream{
-// 		conn: conn,
-// 		buf: oldWriteStream.buf,
-// 		packets: oldWriteStream.packets,
-// 		offset: oldWriteStream.offset,
-// 		seqno: oldWriteStream.seqno,
-// 		packets
-// 	}
-
-// 	go s.ackPackets()
-// 	return s
-// }
-
 func (s *blockWriteStream) Write(b []byte) (int, error) {
 	if s.closed {
 		return 0, io.ErrClosedPipe
@@ -132,67 +123,104 @@ func (s *blockWriteStream) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	n, _ := s.buf.Write(b)
-	err := s.flush(false)
-	return n, err
+	accepted := 0
+	for len(b) > 0 {
+		count := outboundPacketSize - s.buf.Len()
+		if count > len(b) {
+			count = len(b)
+		}
+		s.buf.Write(b[:count])
+		accepted += count
+		b = b[count:]
+		if err := s.flush(false); err != nil {
+			s.setAckError(err)
+			return accepted, err
+		}
+	}
+	return accepted, nil
 }
 
 // finish flushes the rest of the buffered bytes, and then sends a final empty
 // packet signifying the end of the block.
 func (s *blockWriteStream) finish() error {
 	if s.closed {
-		return nil
+		return s.getAckError()
 	}
 	s.closed = true
-
-	// Stop sending heartbeats.
-	close(s.heartbeats)
-
-	if err := s.getAckError(); err != nil {
-		return err
-	}
-
+	s.stopHeartbeats()
 	if err := s.flush(true); err != nil {
-		return err
+		return s.abort(err)
 	}
-
-	// The last packet has no data; it's just a marker that the block is finished.
-	lastPacket := outboundPacket{
-		seqno:     s.seqno,
-		offset:    s.offset,
-		last:      true,
-		checksums: []byte{},
-		data:      []byte{},
+	lastPacket := outboundPacket{seqno: s.seqno, offset: s.offset, last: true}
+	if err := s.queuePacket(lastPacket.seqno); err != nil {
+		return s.abort(err)
 	}
-	s.packets <- lastPacket.seqno
-
+	s.writeLock.Lock()
 	err := s.writePacket(lastPacket)
+	s.writeLock.Unlock()
 	if err != nil {
-		return err
+		return s.abort(err)
 	}
-
-	// Wait for the ack loop to finish.
-	close(s.packets)
+	s.closePackets()
 	<-s.acksDone
-
-	// Check one more time for any ack errors.
 	if err := s.getAckError(); err != nil {
-		return err
+		return s.abort(err)
 	}
-
+	<-s.heartbeatsDone
+	s.buf = bytes.Buffer{}
 	return nil
 }
 
-// flush parcels out the buffered bytes into packets, which it then flushes to
-// the datanode. We keep around a reference to the packet, in case the ack
-// fails, and we need to send it again later.
+func (s *blockWriteStream) stopHeartbeats() {
+	s.stopOnce.Do(func() { close(s.heartbeats) })
+}
+
+func (s *blockWriteStream) closePackets() {
+	s.packetsOnce.Do(func() { close(s.packets) })
+}
+
+func (s *blockWriteStream) abort(err error) error {
+	s.closed = true
+	s.setAckError(err)
+	s.stopHeartbeats()
+	if conn, ok := s.conn.(io.Closer); ok {
+		conn.Close()
+	}
+	s.closePackets()
+	<-s.acksDone
+	<-s.heartbeatsDone
+	s.buf = bytes.Buffer{}
+	return s.getAckError()
+}
+
+func (s *blockWriteStream) queuePacket(seqno int) error {
+	if err := s.getAckError(); err != nil {
+		return err
+	}
+	select {
+	case s.packets <- seqno:
+		return nil
+	case <-s.acksDone:
+		if err := s.getAckError(); err != nil {
+			return err
+		}
+		return io.ErrClosedPipe
+	}
+}
+
+// flush sends complete packets, including a final partial packet when force is true.
 func (s *blockWriteStream) flush(force bool) error {
+	if err := s.getAckError(); err != nil {
+		return err
+	}
 	s.writeLock.Lock()
 	defer s.writeLock.Unlock()
 
 	for s.buf.Len() > 0 && (force || s.buf.Len() >= outboundPacketSize) {
 		packet := s.makePacket()
-		s.packets <- packet.seqno
+		if err := s.queuePacket(packet.seqno); err != nil {
+			return err
+		}
 		s.offset += int64(len(packet.data))
 		s.seqno++
 
@@ -249,67 +277,51 @@ func (s *blockWriteStream) makePacket() outboundPacket {
 // ackError if one fails.
 func (s *blockWriteStream) ackPackets() {
 	reader := bufio.NewReader(s.conn)
-
-Acks:
-	for {
-		p, ok := <-s.packets
-		if !ok {
-			// All packets all acked.
-			return
-		}
-
-		var seqno int
+	for expected := range s.packets {
 		for {
-			// If we fail to read the ack at all, that counts as a failure from the
-			// first datanode (the one we're connected to).
 			ack := &hdfs.PipelineAckProto{}
-			err := readPrefixedMessage(reader, ack)
-			if err != nil {
-				s.ackError = err
-				break Acks
+			if err := readPrefixedMessage(reader, ack); err != nil {
+				s.setAckError(err)
+				return
 			}
-
-			seqno = int(ack.GetSeqno())
-
+			seqno := int(ack.GetSeqno())
+			if len(ack.GetReply()) == 0 {
+				s.setAckError(errInvalidResponse)
+				return
+			}
 			for i, status := range ack.GetReply() {
 				if status != hdfs.Status_SUCCESS {
-					s.ackError = ackError{status: status, seqno: seqno, pipelineIndex: i}
-					break Acks
+					s.setAckError(ackError{status: status, seqno: seqno, pipelineIndex: i})
+					return
 				}
 			}
-
-			if seqno != heartbeatSeqno {
-				break
+			if seqno == heartbeatSeqno {
+				continue
 			}
-		}
-
-		if seqno != p {
-			s.ackError = ErrInvalidSeqno
-			break Acks
+			if seqno != expected {
+				s.setAckError(ErrInvalidSeqno)
+				return
+			}
+			break
 		}
 	}
+}
 
-	// Once we've seen an error, just keep reading packets off the channel (but
-	// not off the socket) until the writing thread figures it out. If we don't,
-	// the upstream thread could deadlock waiting for the channel to have space.
-	for range s.packets {
+func (s *blockWriteStream) setAckError(err error) {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if s.ackError == nil {
+		s.ackError = err
 	}
 }
 
 func (s *blockWriteStream) getAckError() error {
-	select {
-	case <-s.acksDone:
-		if s.ackError != nil {
-			// Check for datanode disk full error
-			if ae, ok := s.ackError.(ackError); ok && ae.status == hdfs.Status_ERROR_BLK_STORAGE_FULL {
-				return syscall.ENOSPC
-			}
-			return s.ackError
-		}
-	default:
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if ae, ok := s.ackError.(ackError); ok && ae.status == hdfs.Status_ERROR_BLK_STORAGE_FULL {
+		return syscall.ENOSPC
 	}
-
-	return nil
+	return s.ackError
 }
 
 // A packet for the datanode:
@@ -335,12 +347,12 @@ func (s *blockWriteStream) writePacket(p outboundPacket) error {
 	// Don't ask me why this doesn't include the header proto...
 	totalLength := len(p.data) + len(p.checksums) + 4
 
-	header := make([]byte, 6, 6+totalLength)
 	infoBytes, err := proto.Marshal(headerInfo)
 	if err != nil {
 		return err
 	}
 
+	header := make([]byte, 6, 6+len(infoBytes)+len(p.checksums)+len(p.data))
 	binary.BigEndian.PutUint32(header, uint32(totalLength))
 	binary.BigEndian.PutUint16(header[4:], uint16(len(infoBytes)))
 	header = append(header, infoBytes...)
@@ -356,6 +368,7 @@ func (s *blockWriteStream) writePacket(p outboundPacket) error {
 }
 
 func (s *blockWriteStream) writeHeartbeats() {
+	defer close(s.heartbeatsDone)
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -363,8 +376,12 @@ func (s *blockWriteStream) writeHeartbeats() {
 		select {
 		case <-ticker.C:
 			s.writeLock.Lock()
-			s.conn.Write(heartbeatPacket)
+			_, err := s.conn.Write(heartbeatPacket)
 			s.writeLock.Unlock()
+			if err != nil {
+				s.setAckError(err)
+				return
+			}
 		case <-s.heartbeats:
 			return
 		}

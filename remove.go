@@ -26,27 +26,21 @@ func (c *Client) RemoveAll(name string) error {
 }
 
 func delete(c *Client, name string, recursive bool) error {
-	_, err := c.getFileInfo(name)
-	if err != nil {
-		return &os.PathError{"remove", name, err}
-	}
-
 	req := &hdfs.DeleteRequestProto{
 		Src:       proto.String(name),
 		Recursive: proto.Bool(recursive),
 	}
 	resp := &hdfs.DeleteResponseProto{}
 
-	err = c.leaderNamenode.Execute("delete", req, resp)
+	err := c.leaderNamenode.Execute("delete", req, resp)
 	if err != nil {
-		return &os.PathError{"remove", name, interpretException(err)}
+		return &os.PathError{Op: "remove", Path: name, Err: interpretException(err)}
 	} else if resp.Result == nil {
-		return &os.PathError{
-			"remove",
-			name,
-			errors.New("unexpected empty response"),
-		}
+		return &os.PathError{Op: "remove", Path: name, Err: errors.New("unexpected empty response")}
 	}
 
+	if !resp.GetResult() {
+		return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
+	}
 	return nil
 }

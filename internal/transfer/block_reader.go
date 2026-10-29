@@ -69,21 +69,34 @@ func (br *BlockReader) Read(b []byte) (int, error) {
 		br.Close()
 		return 0, io.EOF
 	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if remaining := br.Block.GetB().GetNumBytes() - uint64(br.Offset); uint64(len(b)) > remaining {
+		b = b[:int(remaining)]
+	}
 
 	if br.datanodes == nil {
 		locs := br.Block.GetLocs()
 		datanodes := make([]string, len(locs))
 		for i, loc := range locs {
-			datanodes[i] = getDatanodeAddress(loc.GetId(), br.UseDatanodeHostname)
+			var err error
+			datanodes[i], err = getDatanodeAddress(loc.GetId(), br.UseDatanodeHostname)
+			if err != nil {
+				return 0, err
+			}
 		}
 
 		br.datanodes = newDatanodeFailover(datanodes)
 	}
 
 	if len(br.Block.Data) > 0 {
+		if br.Offset < 0 || br.Offset > int64(len(br.Block.Data)) {
+			return 0, io.ErrUnexpectedEOF
+		}
 		remaining := br.Block.Data[br.Offset:]
 		if len(remaining) == 0 {
-			return 0, io.EOF
+			return 0, io.ErrUnexpectedEOF
 		} else {
 			copied := copy(b, remaining)
 			br.Offset += int64(copied)
@@ -107,7 +120,14 @@ func (br *BlockReader) Read(b []byte) (int, error) {
 		// a partial read (n < len(b)).
 		n, err := br.stream.Read(b)
 		br.Offset += int64(n)
+		if err == io.EOF && uint64(br.Offset) < br.Block.GetB().GetNumBytes() {
+			err = io.ErrUnexpectedEOF
+		}
 		if err != nil && err != io.EOF {
+			if br.conn != nil {
+				br.conn.Close()
+				br.conn = nil
+			}
 			br.stream = nil
 			br.datanodes.recordFailure(err)
 			if n > 0 {
@@ -183,6 +203,10 @@ func (br *BlockReader) Skip(fileOldOffset int64, fileNewOffset int64) error {
 				err = fmt.Errorf("failed to skip correct number of bytes. Expected to skip: %d, skipped: %d", amountToSkip, w)
 			}
 
+			if br.conn != nil {
+				br.conn.Close()
+				br.conn = nil
+			}
 			br.stream = nil
 			br.datanodes.recordFailure(err)
 			return err
@@ -210,8 +234,23 @@ func (br *BlockReader) connectNext() error {
 		br.DialFunc = (&net.Dialer{}).DialContext
 	}
 
-	conn, err := br.DialFunc(context.Background(), "tcp", address)
+	ctx := context.Background()
+	if !br.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, br.deadline)
+		defer cancel()
+	}
+	conn, err := br.DialFunc(ctx, "tcp", address)
 	if err != nil {
+		return err
+	}
+	connected := false
+	defer func() {
+		if !connected {
+			conn.Close()
+		}
+	}()
+	if err := conn.SetDeadline(br.deadline); err != nil {
 		return err
 	}
 
@@ -249,6 +288,9 @@ func (br *BlockReader) connectNext() error {
 
 	chunkOffset := int64(readInfo.GetChunkOffset())
 	chunkSize := int(checksumInfo.GetBytesPerChecksum())
+	if chunkSize <= 0 || chunkOffset < 0 || chunkOffset > br.Offset || br.Offset-chunkOffset >= int64(chunkSize) {
+		return errInvalidResponse
+	}
 	stream := newBlockReadStream(conn, chunkSize, checksumTab, checksumSize)
 
 	// The read will start aligned to a chunk boundary, so we need to skip
@@ -266,13 +308,8 @@ func (br *BlockReader) connectNext() error {
 		}
 	}
 
-	br.stream = stream
-	br.conn = conn
-	err = br.conn.SetDeadline(br.deadline)
-	if err != nil {
-		return err
-	}
-
+	br.stream, br.conn = stream, conn
+	connected = true
 	return nil
 }
 

@@ -1,12 +1,15 @@
 package transfer
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
@@ -14,11 +17,11 @@ import (
 )
 
 const (
-	saslIntegrityPrefixLength = 4
-	macDataLen                = 4
-	macHMACLen                = 10
-	macMsgTypeLen             = 2
-	macSeqNumLen              = 4
+	saslIntegrityTrailerLength = 16
+	macDataLen                 = 4
+	macHMACLen                 = 10
+	macMsgTypeLen              = 2
+	macSeqNumLen               = 4
 )
 
 var macMsgType = [2]byte{0x00, 0x01}
@@ -70,9 +73,9 @@ func (d *digestMD5Handshake) challengeStep1(challenge []byte) ([]byte, error) {
 
 // challengeStep2 implements step two of RFC 2831.
 func (d *digestMD5Handshake) challengeStep2(challenge []byte) error {
-	rspauth := strings.Split(string(challenge), "=")
+	rspauth := strings.SplitN(string(challenge), "=", 2)
 
-	if rspauth[0] != "rspauth" {
+	if len(rspauth) != 2 || rspauth[0] != "rspauth" {
 		return fmt.Errorf("rspauth not in '%s'", string(challenge))
 	}
 
@@ -86,28 +89,28 @@ func (d *digestMD5Handshake) challengeStep2(challenge []byte) error {
 // compute implements the computation of md5 digest authentication per RFC 2831.
 // The response value computation is defined as:
 //
-//     HEX(KD(HEX(H(A1)),
-//       { nonce-value, ":", nc-value, ":", cnonce-value, ":", qop-value,
-//         ":", HEX(H(A2)) }))
-//     A1 = { H({ username-value, ":", realm-value, ":", passwd }),
-//            ":", nonce-value, ":", cnonce-value }
+//	    HEX(KD(HEX(H(A1)),
+//	      { nonce-value, ":", nc-value, ":", cnonce-value, ":", qop-value,
+//	        ":", HEX(H(A2)) }))
+//	    A1 = { H({ username-value, ":", realm-value, ":", passwd }),
+//	           ":", nonce-value, ":", cnonce-value }
 //
-//   If "qop" is "auth":
+//	  If "qop" is "auth":
 //
-//		 A2 = { "AUTHENTICATE:", digest-uri-value }
+//			 A2 = { "AUTHENTICATE:", digest-uri-value }
 //
-//   If "qop" is "auth-int" or "auth-conf":
+//	  If "qop" is "auth-int" or "auth-conf":
 //
-//       A2 = { "AUTHENTICATE:", digest-uri-value,
-//              ":00000000000000000000000000000000" }
+//	      A2 = { "AUTHENTICATE:", digest-uri-value,
+//	             ":00000000000000000000000000000000" }
 //
-//   Where:
+//	  Where:
 //
-//     - { a, b, ... } is the concatenation of the octet strings a, b, ...
-//     - H(s) is the 16 octet MD5 Hash [RFC1321] of the octet string s
-//     - KD(k, s) is H({k, ":", s})
-//     - HEX(n) is the representation of the 16 octet MD5 hash n as a string of
-//       32 hex digits (with alphabetic characters in lower case)
+//	    - { a, b, ... } is the concatenation of the octet strings a, b, ...
+//	    - H(s) is the 16 octet MD5 Hash [RFC1321] of the octet string s
+//	    - KD(k, s) is H({k, ":", s})
+//	    - HEX(n) is the representation of the 16 octet MD5 hash n as a string of
+//	      32 hex digits (with alphabetic characters in lower case)
 func (d *digestMD5Handshake) compute(initial bool) string {
 	x := hex.EncodeToString(h(d.a1()))
 	y := strings.Join([]string{
@@ -220,4 +223,18 @@ func lenEncodeBytes(seqnum int) (out [4]byte) {
 	out[2] = byte((seqnum >> 8) & 0xFF)
 	out[3] = byte(seqnum & 0xFF)
 	return
+}
+
+func readSASLFrame(reader io.Reader, buffer *bytes.Buffer) error {
+	var length uint32
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return err
+	}
+	if length < saslIntegrityTrailerLength || length > maxDataTransferMessageLength {
+		return errInvalidResponse
+	}
+	buffer.Reset()
+	buffer.Grow(int(length))
+	_, err := io.CopyN(buffer, reader, int64(length))
+	return err
 }

@@ -72,6 +72,9 @@ func (bw *BlockWriter) SetDeadline(t time.Time) error {
 //
 // This will hopefully be fixed in a future release.
 func (bw *BlockWriter) Write(b []byte) (int, error) {
+	if bw.closed {
+		return 0, io.ErrClosedPipe
+	}
 	var blockFull bool
 	if bw.Offset >= bw.BlockSize {
 		return 0, ErrEndOfBlock
@@ -91,7 +94,7 @@ func (bw *BlockWriter) Write(b []byte) (int, error) {
 	// TODO: handle failures, set up recovery pipeline
 	n, err := bw.stream.Write(b)
 	bw.Offset += int64(n)
-	*bw.Block.B.NumBytes = uint64(bw.Offset)
+	bw.Block.B.NumBytes = proto.Uint64(uint64(bw.Offset))
 	if err == nil && blockFull {
 		err = ErrEndOfBlock
 	}
@@ -101,6 +104,9 @@ func (bw *BlockWriter) Write(b []byte) (int, error) {
 
 // Flush flushes any unwritten packets out to the datanode.
 func (bw *BlockWriter) Flush() error {
+	if bw.closed {
+		return io.ErrClosedPipe
+	}
 	if bw.stream != nil {
 		return bw.stream.flush(true)
 	}
@@ -112,6 +118,11 @@ func (bw *BlockWriter) Flush() error {
 // datanode, and sends a final packet indicating the end of the block. The
 // block must still be finalized with the namenode.
 func (bw *BlockWriter) Close() error {
+	if bw.Append && bw.stream == nil && !bw.closed {
+		if err := bw.connectNext(); err != nil {
+			return err
+		}
+	}
 	bw.closed = true
 	if bw.conn != nil {
 		defer bw.conn.Close()
@@ -128,17 +139,45 @@ func (bw *BlockWriter) Close() error {
 	return nil
 }
 
+// Abort discards pending data and stops the pipeline without finalizing the block.
+func (bw *BlockWriter) Abort() {
+	bw.closed = true
+	if bw.stream != nil {
+		bw.stream.abort(io.ErrClosedPipe)
+	} else if bw.conn != nil {
+		bw.conn.Close()
+	}
+}
+
 func (bw *BlockWriter) connectNext() error {
-	address := getDatanodeAddress(bw.currentPipeline()[0].GetId(), bw.UseDatanodeHostname)
+	if len(bw.currentPipeline()) == 0 {
+		return errInvalidResponse
+	}
+	address, err := getDatanodeAddress(bw.currentPipeline()[0].GetId(), bw.UseDatanodeHostname)
+	if err != nil {
+		return err
+	}
 
 	if bw.DialFunc == nil {
 		bw.DialFunc = (&net.Dialer{}).DialContext
 	}
 
-	conn, err := bw.DialFunc(context.Background(), "tcp", address)
+	ctx := context.Background()
+	if !bw.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, bw.deadline)
+		defer cancel()
+	}
+	conn, err := bw.DialFunc(ctx, "tcp", address)
 	if err != nil {
 		return err
 	}
+	connected := false
+	defer func() {
+		if !connected {
+			conn.Close()
+		}
+	}()
 
 	err = conn.SetDeadline(bw.deadline)
 	if err != nil {
@@ -159,6 +198,7 @@ func (bw *BlockWriter) connectNext() error {
 
 	bw.conn = conn
 	bw.stream = newBlockWriteStream(conn, bw.Offset)
+	connected = true
 	return nil
 }
 
@@ -214,6 +254,9 @@ func (bw *BlockWriter) generationTimestamp() int64 {
 // And: https://github.com/apache/hadoop/blob/6314843881b4c67d08215e60293f8b33242b9416/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java#L1462
 func (bw *BlockWriter) writeBlockWriteRequest(w io.Writer) error {
 	pipeline := bw.currentPipeline()
+	if len(pipeline) == 0 {
+		return errInvalidResponse
+	}
 	targets := pipeline[1:]
 
 	op := &hdfs.OpWriteBlockProto{
@@ -224,7 +267,6 @@ func (bw *BlockWriter) writeBlockWriteRequest(w io.Writer) error {
 			},
 			ClientName: proto.String(bw.ClientName),
 		},
-		StorageType:           bw.Block.StorageTypes[0].Enum(),
 		TargetStorageTypes:    bw.convertStorgeTypeToProto(1),
 		Targets:               targets,
 		Stage:                 bw.currentStage().Enum(),
@@ -236,6 +278,12 @@ func (bw *BlockWriter) writeBlockWriteRequest(w io.Writer) error {
 			Type:             hdfs.ChecksumTypeProto_CHECKSUM_CRC32C.Enum(),
 			BytesPerChecksum: proto.Uint32(outboundChunkSize),
 		},
+	}
+	if len(bw.Block.StorageTypes) > 0 {
+		if len(bw.Block.StorageTypes) != len(pipeline) {
+			return errInvalidResponse
+		}
+		op.StorageType = bw.Block.StorageTypes[0].Enum()
 	}
 
 	// Name the storage of every pipeline node, as the Java client does: the
